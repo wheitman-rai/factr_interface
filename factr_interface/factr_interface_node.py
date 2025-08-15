@@ -24,7 +24,7 @@ import rclpy
 from rclpy.impl import rcutils_logger
 from rclpy.action import ActionClient
 from rclpy.node import Node, ParameterDescriptor, ParameterType
-from time import time
+from time import time, sleep
 
 
 # Messages
@@ -34,9 +34,10 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint, JointTrajectory
 
 # See https://emanual.robotis.com/docs/en/dxl/x/xc330-t288/#control-table-of-ram-area
-ADDR_PRESENT_POSITION = 132
 ADDR_GOAL_POSITION = 116
 ADDR_GOAL_CURRENT = 102  # This is the address for Goal Current
+ADDR_HOMING_OFFSET = 20
+ADDR_PRESENT_POSITION = 132
 ADDR_OPERATING_MODE = 11
 ADDR_CURRENT_LIMIT = 38  # This address may vary by model.
 LEN_PRESENT_POSITION = 4  # 4 bytes for position data
@@ -94,11 +95,121 @@ class Dynamixel:
         pos_raw = dxl_present_position % 4096  # Limit to one rotation
         pos_degrees = pos_raw * 0.087891
         pos_radians = pos_degrees * np.pi / 180.0
-        pos_radians_with_offset = pos_radians - self.offset_radians
+        pos_radians_with_offset = pos_radians
         return pos_radians_with_offset
 
     def cal(self):
-        self.offset_radians = self.pos
+        """Calibrate the Dynamixel by setting its homing offset"""
+
+        # 1. Disable torque before changing the operating mode
+        self.packet_handler.write1ByteTxRx(
+            self.port_handler, self.id, ADDR_TORQUE_ENABLE, 0
+        )
+
+        # 2. Set the Operating Mode to Current-based Position Control (Value 5)
+        dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
+            self.port_handler, self.id, ADDR_OPERATING_MODE, 5
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            print(self.packet_handler.getTxRxResult(dxl_comm_result))
+            return
+        elif dxl_error != 0:
+            print(self.packet_handler.getRxPacketError(dxl_error))
+            return
+
+        # 3. Get the current position
+        dxl_present_position, result, error = self.packet_handler.read4ByteTxRx(
+            self.port_handler, self.id, ADDR_PRESENT_POSITION
+        )
+
+        print(f"Pos was: {dxl_present_position}")
+
+        if result != COMM_SUCCESS:
+            print("%s" % self.packet_handler.getTxRxResult(result))
+            return
+        elif error != 0:
+            print("%s" % self.packet_handler.getRxPacketError(error))
+            return
+
+        dxl_comm_result, dxl_error = self.packet_handler.write4ByteTxRx(
+            self.port_handler, self.id, ADDR_HOMING_OFFSET, 0
+        )
+
+        dxl_present_position, result, error = self.packet_handler.read4ByteTxRx(
+            self.port_handler, self.id, ADDR_PRESENT_POSITION
+        )
+
+        # 4. Write dxl_present_position to the negative of its homing offset
+        dxl_comm_result, dxl_error = self.packet_handler.write4ByteTxRx(
+            self.port_handler, self.id, ADDR_HOMING_OFFSET, -dxl_present_position
+        )
+
+        if dxl_comm_result != COMM_SUCCESS:
+            print(self.packet_handler.getTxRxResult(dxl_comm_result))
+            return
+        elif dxl_error != 0:
+            print(self.packet_handler.getRxPacketError(dxl_error))
+            return
+
+        # 7. Read the new position after the reboot
+        dxl_present_position, result, error = self.packet_handler.read4ByteTxRx(
+            self.port_handler, self.id, ADDR_PRESENT_POSITION
+        )
+
+        if result != COMM_SUCCESS:
+            print("%s" % self.packet_handler.getTxRxResult(result))
+        elif error != 0:
+            print("%s" % self.packet_handler.getRxPacketError(error))
+        else:
+            print(
+                f"Pos is now: {dxl_present_position}"
+            )  # Should be 0 or very close to it
+
+    def spring_to(self, goal_pos_radians: float, goal_current_ma: int = 100):
+        """
+        Sets the goal current and goal pose of a Dynamixel, allowing virtual springs
+
+
+
+        """
+
+        # 1. Disable torque before changing the operating mode
+        self.packet_handler.write1ByteTxRx(
+            self.port_handler, self.id, ADDR_TORQUE_ENABLE, 0
+        )
+        print("Torque disabled.")
+
+        # 2. Set the Operating Mode to Current-based Position Control (Value 5)
+        # This value may need to be stored in the EEPROM and may require a reboot
+        # to take effect permanently, but can be set in RAM for a single session.
+        dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
+            self.port_handler, self.id, ADDR_OPERATING_MODE, 5
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            print(self.packet_handler.getTxRxResult(dxl_comm_result))
+        elif dxl_error != 0:
+            print(self.packet_handler.getRxPacketError(dxl_error))
+        else:
+            print("Operating mode set to Current-based Position Control.")
+
+        # 3. Enable motor torque
+        self.packet_handler.write1ByteTxRx(
+            self.port_handler, self.id, ADDR_TORQUE_ENABLE, 1
+        )
+        print("Torque enabled.")
+
+        # 4. Set a goal position and goal current
+        # Range for goal current is typically 0 to 2047 (relative to maximum current)
+
+        # Write the Goal Position
+        raw_goal_pos = int(goal_pos_radians * 360 / np.pi / 0.087891)
+        self.packet_handler.write4ByteTxRx(
+            self.port_handler, self.id, ADDR_GOAL_POSITION, raw_goal_pos
+        )
+        # Write the Goal Current
+        self.packet_handler.write2ByteTxRx(
+            self.port_handler, self.id, ADDR_GOAL_CURRENT, goal_current_ma
+        )
 
 
 class Factr:
@@ -147,6 +258,17 @@ class Factr:
             if not self.sync_read_group.addParam(id):
                 self.logger.error(f"Failed to add motor {id} to the sync read group")
 
+    def spring_to_home(self) -> None:
+        """Torque each motor to bias it toward the home position"""
+
+        for dynamixel in self.dynamixels:
+            if dynamixel.id in [1, 4]:
+                dynamixel.spring_to(0.0, 100)
+            elif dynamixel.id in [2]:
+                dynamixel.spring_to(0.0, 300)
+            else:
+                dynamixel.spring_to(0.0, 50)
+
     @property
     def pos(self):
         """Returns the position of each motor in radians, accounting for offsets from calibration
@@ -184,7 +306,9 @@ class Factr:
 
         return positions
 
-    def calibrate_from_file(self):
+    def calibrate_from_file(self) -> None:
+        """Load position offsets from calibration.yaml"""
+
         try:
             # Get the path to the package's share directory
             package_share_directory = get_package_share_directory("factr_interface")
@@ -231,6 +355,12 @@ class Factr:
         return os.path.join(package_share_directory, "config", "calibration.yaml")
 
     def cal(self, save_to_file=True):
+        """Overwrite the position offsets, and optionally save them to calibration.yaml
+
+        Args:
+            save_to_file (bool, optional): Whether to save to calibration.yaml. Defaults to True.
+        """
+
         # Move FACTR straight up, then set all position offsets to zero
         for dynamixel in self.dynamixels:
             dynamixel.cal()
@@ -283,22 +413,16 @@ class FactrInterfaceNode(Node):
             self, GripperCommand, "/robotiq_gripper_controller/gripper_cmd"
         )
 
-        # self.set_up_motors()
-
         self.factr = Factr()
 
-        # input("Move FACTR to zero position, then press Enter...")
-        # self.factr.cal()
+        input("Move FACTR to zero position, then press Enter...")
+        self.factr.cal()
 
+        # Load position offsets from calibration.yaml
         self.factr.calibrate_from_file()
 
-        while True:
-            for pos in self.factr.pos:
-                print(f"{pos:+03.2f}")
+        self.factr.spring_to_home()
 
-        self.create_timer(0.04, self.spin_interface)
-
-        self.time_last_state_received = 0.0
 
     def joint_state_cb(self, msg: JointState) -> None:
         self.time_last_state_received = time()
@@ -324,8 +448,6 @@ class FactrInterfaceNode(Node):
 
         self.follower_at_zero = np.linalg.norm(self.follower_joint_angles) < 1.0
 
-        # print(self.follower_joint_state)
-
     def set_up_motors(self) -> None:
         """
         Initializes and configures the Dynamixel motors for communication.
@@ -334,7 +456,7 @@ class FactrInterfaceNode(Node):
         """
 
         self.port = self.get_parameter("serial_port").value
-        self.dynamixel_ids: List[int] = self.get_parameter("dynamixel_ids").value
+        self.dynamixel_ids: List[int] = self.get_parameter("dynamixel_ids").value  # type: ignore
 
         self.port_handler = PortHandler(self.port)  # TODO WSH: Parameterize
         self.packet_handler: Protocol2PacketHandler = PacketHandler(protocol_version=2.0)  # type: ignore
@@ -345,12 +467,12 @@ class FactrInterfaceNode(Node):
             LEN_PRESENT_POSITION,
         )
 
-        # self.sync_write_group = GroupSyncWrite(
-        #     self.port_handler,
-        #     self.packet_handler,
-        #     ADDR_GOAL_POSITION,
-        #     LEN_GOAL_POSITION,
-        # )
+        self.sync_write_group = GroupSyncWrite(
+            self.port_handler,
+            self.packet_handler,
+            ADDR_GOAL_POSITION,
+            LEN_GOAL_POSITION,
+        )
 
         if self.port_handler.openPort():
             print(f"Successfully connected to FACTR on port {self.port}")
@@ -376,130 +498,6 @@ class FactrInterfaceNode(Node):
             for motor in self.motors:
                 print(motor.pos)
 
-        quit()
-
-        # Add all motors to the Sync Read Group
-        # for dynamixel_id in self.dynamixel_ids:
-        #     successful = self.sync_read_group.addParam(dynamixel_id)
-
-        #     if not successful:
-        #         self.get_logger().error(
-        #             f"Failed to add motor {dynamixel_id} to the sync read group"
-        #         )
-
-        # Set zero position
-        # self.get_logger().info("Hold FACTR in the zero position and press enter")
-        # input("Press enter when ready...")
-        # self.zero_angles = self.fetch_factr_angles()
-
-        # Enable torques
-        # print(f"Holding at {self.zero_angles}")
-        # self.set_factr_goals(self.zero_angles, np.ones(8) * 45)
-
-    def set_factr_goals(self, angles: np.ndarray, currents: np.ndarray):
-
-        for id in range(1, 9):  # Dynamixel IDs
-
-            # Disable torque if enabled
-            dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-                self.port_handler, id, ADDR_TORQUE_ENABLE, 0
-            )
-
-            # Set operating mode to current-based position control
-            dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-                self.port_handler, id, ADDR_OPERATING_MODE, 5
-            )
-            if dxl_comm_result != COMM_SUCCESS:
-                print(self.packet_handler.getTxRxResult(dxl_comm_result))
-            elif dxl_error != 0:
-                print(self.packet_handler.getRxPacketError(dxl_error))
-            else:
-                print("Operating mode set to Current-based Position Control.")
-
-            # Enable torque
-            dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-                self.port_handler, id, ADDR_TORQUE_ENABLE, 1
-            )
-
-            if dxl_comm_result != COMM_SUCCESS:
-                print("%s" % self.packet_handler.getTxRxResult(dxl_comm_result))
-            elif dxl_error != 0:
-                print("%s" % self.packet_handler.getRxPacketError(dxl_error))
-            else:
-                print("Dynamixel#%d has been successfully connected" % id)
-
-            # Write the Goal Position
-            pos = int(
-                angles[id - 1] / 0.087891
-            )  # Dynamixel motor's typical resolution, in deg/tick
-            self.packet_handler.write4ByteTxRx(
-                self.port_handler, id, ADDR_GOAL_POSITION, pos
-            )
-
-            # Write the Goal Current
-            dxl_comm_result, dxl_error = self.packet_handler.write2ByteTxRx(
-                self.port_handler, id, ADDR_GOAL_CURRENT, int(currents[id - 1])
-            )
-
-            if dxl_comm_result != COMM_SUCCESS:
-                print(self.packet_handler.getTxRxResult(dxl_comm_result))
-            elif dxl_error != 0:
-                print(self.packet_handler.getRxPacketError(dxl_error))
-            else:
-                print("Goal position sent successfully.")
-
-    def enable_motor_torque(self, id: int, limit: int = 50):
-        assert id >= 1 and id <= 8, "ID must be between 1 and 8"
-
-        # Disable torque if enabled
-        dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-            self.port_handler, id, ADDR_TORQUE_ENABLE, 0
-        )
-
-        # Set operating mode to current-based position control
-        dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-            self.port_handler, id, ADDR_OPERATING_MODE, 5
-        )
-        if dxl_comm_result != COMM_SUCCESS:
-            print(self.packet_handler.getTxRxResult(dxl_comm_result))
-        elif dxl_error != 0:
-            print(self.packet_handler.getRxPacketError(dxl_error))
-        else:
-            print("Operating mode set to Current-based Position Control.")
-
-        # Enable torque
-        dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-            self.port_handler, id, ADDR_TORQUE_ENABLE, 1
-        )
-        # dxl_comm_result, dxl_error = self.packet_handler.write2ByteTxRx(
-        #     self.port_handler, id, ADDR_CURRENT_LIMIT, limit
-        # )
-        if dxl_comm_result != COMM_SUCCESS:
-            print("%s" % self.packet_handler.getTxRxResult(dxl_comm_result))
-        elif dxl_error != 0:
-            print("%s" % self.packet_handler.getRxPacketError(dxl_error))
-        else:
-            print("Dynamixel#%d has been successfully connected" % id)
-
-        GOAL_POSITION = 2048  # Midpoint
-        GOAL_CURRENT = 80  # Low current value for compliant movement
-
-        # Write the Goal Position
-        self.packet_handler.write4ByteTxRx(
-            self.port_handler, id, ADDR_GOAL_POSITION, GOAL_POSITION
-        )
-        # Write the Goal Current
-        dxl_comm_result, dxl_error = self.packet_handler.write2ByteTxRx(
-            self.port_handler, id, ADDR_GOAL_CURRENT, GOAL_CURRENT
-        )
-
-        if dxl_comm_result != COMM_SUCCESS:
-            print(self.packet_handler.getTxRxResult(dxl_comm_result))
-        elif dxl_error != 0:
-            print(self.packet_handler.getRxPacketError(dxl_error))
-        else:
-            print("Goal position sent successfully.")
-
     def map(self, factr_min, factr_max, follower_min, follower_max, value) -> float:
         factr_range = factr_max - factr_min
 
@@ -513,128 +511,7 @@ class FactrInterfaceNode(Node):
 
         return follower_value
 
-    def spin_interface(self) -> None:
-
-        # if not self.factr_and_follower_initially_synced:
-
-        #     if not self.follower_at_zero:
-        #         self.get_logger().warning(
-        #             f"Follower must be at zero position to start."
-        #         )
-        #         return
-
-        if self.follower_joint_angles is None:
-            self.get_logger().warning(
-                f"No joint state received from follower. Skipping controller update."
-            )
-            return
-        elif len(self.follower_joint_angles) != 8:
-            self.get_logger().error(
-                f"Expected 8 follower angles, but got {len(self.follower_joint_angles)}"
-            )
-            return
-
-        self.fetch_factr_angles(radians=True, offset=True)
-
-        self.publish_joint_state()
-
-        gripper_position = self.map(-1, 0.0, 0.0, 1.0, self.factr_angles[7])
-        self.factr_angles[7] = gripper_position
-
-        command_msg = JointTrajectory()
-        command_msg.joint_names = [f"joint_{i}" for i in range(1, 8)]
-
-        position_error = self.factr_angles - self.follower_joint_angles
-
-        if (
-            not self.factr_and_follower_initially_synced
-            and np.linalg.norm(position_error) > 0.5
-        ):
-            self.get_logger().warning(f"Align FACTR with follower to start.")
-            self.get_logger().warning(f"{position_error}")
-            return
-
-        Kp = np.zeros_like(position_error) * 10.0
-
-        print(position_error)
-
-        # Control the gripper
-        gripper_command = GripperCommand.Goal()
-        gripper_command.command.position = gripper_position
-        gripper_command.command.max_effort = 100.0
-        gripper_goal_future_ = self.gripper_client.send_goal_async(gripper_command)
-
-        # And the other joints...
-
-        norm_joint_position_error = np.linalg.norm(position_error)
-        print(norm_joint_position_error)
-        time_from_start = norm_joint_position_error
-
-        trajectory_point = JointTrajectoryPoint()
-        follower_positions = np.zeros(7)
-        follower_positions[3:] = self.factr_angles[3:7]
-        trajectory_point.positions = list(follower_positions)
-        trajectory_point.time_from_start = Duration(
-            sec=int(np.floor(time_from_start)),
-            nanosec=int((time_from_start - np.floor(time_from_start)) * 1e9),
-        )
-        command_msg.points = [trajectory_point]
-
-        self.joint_command_pub.publish(command_msg)
-
-    # def nudge_toward_config(angles: np.ndarray, max_torques = np.ndarray)
-
-    def fetch_factr_angles(self, radians=False, offset=False) -> np.ndarray:
-
-        start = time()
-
-        self.factr_angles = []
-
-        # Read the position of each motor in the group
-        dxl_comm_result = self.sync_read_group.txRxPacket()
-        if dxl_comm_result != COMM_SUCCESS:
-            print(f"{self.packet_handler.getTxRxResult(dxl_comm_result)}")
-            exit()
-
-        for idx, dynamixel_id in enumerate(self.dynamixel_ids):
-
-            pos = self.sync_read_group.getData(
-                dynamixel_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
-            )
-
-            print(f"{idx} : {pos}")
-
-            # Handle signed integers from Dynamixel
-            # if pos > 2**31:
-            #     pos -= 2**32
-
-            # Get position in DEGREES
-            pos *= 0.087891  # Dynamixel motor's typical resolution, in deg/tick
-
-            if offset:
-                # Offset the position relative to zero position
-                # (FACTR pointing straight up)
-                pos -= self.zero_angles[idx]
-
-            if radians:
-                pos *= np.pi / 180.0
-
-            self.factr_angles.append(pos)
-
-        print(f"Took {time() - start} secs")
-
-        return np.asarray(self.factr_angles, dtype=np.float32)
-
-    def publish_joint_state(self) -> None:
-        msg = JointState()
-
-        msg.header.stamp = self.get_clock().now().to_msg()
-
-        msg.position = [
-            float(pos) for pos in self.factr_angles
-        ]  # TODO: Perform proper conversion!
-
-        self.joint_state_pub.publish(msg)
+    def spin_interface(self) -> None: ...
 
 
 def main(args=None):
