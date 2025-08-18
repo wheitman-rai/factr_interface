@@ -165,7 +165,14 @@ class Dynamixel:
                 f"Pos is now: {dxl_present_position}"
             )  # Should be 0 or very close to it
 
-    def spring_to(self, goal_pos_radians: float, goal_current_ma: int = 100):
+            if abs(dxl_present_position) > 10:
+                self.logger.warning(
+                    f"Motor {self.id} has position {dxl_present_position} after calibration!"
+                )
+
+    def spring_to(
+        self, goal_pos_radians: float, goal_current_ma: int = 100, initialize=False
+    ):
         """
         Sets the goal current and goal pose of a Dynamixel, allowing virtual springs
 
@@ -173,36 +180,33 @@ class Dynamixel:
 
         """
 
-        # 1. Disable torque before changing the operating mode
-        self.packet_handler.write1ByteTxRx(
-            self.port_handler, self.id, ADDR_TORQUE_ENABLE, 0
-        )
-        print("Torque disabled.")
+        if initialize:
+            # 1. Disable torque before changing the operating mode
+            self.packet_handler.write1ByteTxRx(
+                self.port_handler, self.id, ADDR_TORQUE_ENABLE, 0
+            )
 
-        # 2. Set the Operating Mode to Current-based Position Control (Value 5)
-        # This value may need to be stored in the EEPROM and may require a reboot
-        # to take effect permanently, but can be set in RAM for a single session.
-        dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-            self.port_handler, self.id, ADDR_OPERATING_MODE, 5
-        )
-        if dxl_comm_result != COMM_SUCCESS:
-            print(self.packet_handler.getTxRxResult(dxl_comm_result))
-        elif dxl_error != 0:
-            print(self.packet_handler.getRxPacketError(dxl_error))
-        else:
-            print("Operating mode set to Current-based Position Control.")
+            # 2. Set the Operating Mode to Current-based Position Control (Value 5)
+            # This value may need to be stored in the EEPROM and may require a reboot
+            # to take effect permanently, but can be set in RAM for a single session.
+            dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
+                self.port_handler, self.id, ADDR_OPERATING_MODE, 5
+            )
+            if dxl_comm_result != COMM_SUCCESS:
+                self.logger.error(self.packet_handler.getTxRxResult(dxl_comm_result))
+            elif dxl_error != 0:
+                self.logger.error(self.packet_handler.getRxPacketError(dxl_error))
 
-        # 3. Enable motor torque
-        self.packet_handler.write1ByteTxRx(
-            self.port_handler, self.id, ADDR_TORQUE_ENABLE, 1
-        )
-        print("Torque enabled.")
+            # 3. Enable motor torque
+            self.packet_handler.write1ByteTxRx(
+                self.port_handler, self.id, ADDR_TORQUE_ENABLE, 1
+            )
 
         # 4. Set a goal position and goal current
         # Range for goal current is typically 0 to 2047 (relative to maximum current)
 
         # Write the Goal Position
-        raw_goal_pos = int(goal_pos_radians * 360 / np.pi / 0.087891)
+        raw_goal_pos = int(goal_pos_radians * 180 / np.pi / 0.087891)
         self.packet_handler.write4ByteTxRx(
             self.port_handler, self.id, ADDR_GOAL_POSITION, raw_goal_pos
         )
@@ -247,6 +251,15 @@ class Factr:
             LEN_PRESENT_POSITION,
         )
 
+        self.sync_write_pos = GroupSyncWrite(
+            self.port_handler,
+            self.packet_handler,
+            ADDR_GOAL_POSITION,
+            LEN_GOAL_POSITION,
+        )
+
+        self.sync_write_current = GroupSyncWrite(self.port_handler, self.packet_handler, ADDR_GOAL_CURRENT, 2)
+
         # Instantiate 8 Dynamixels
         self.dynamixels: List[Dynamixel] = []
         for id in ids:
@@ -258,16 +271,80 @@ class Factr:
             if not self.sync_read_group.addParam(id):
                 self.logger.error(f"Failed to add motor {id} to the sync read group")
 
-    def spring_to_home(self) -> None:
+    def spring_to(self, positions, currents, initialize=False):
+
+        """
+        Sets the goal position and goal current of all Dynamixels at once
+        using GroupSyncWrite.
+        """
+        start = time()
+
+        if initialize:
+            # 1. Disable torque before changing the operating mode for all motors
+            for dynamixel in self.dynamixels:
+                self.packet_handler.write1ByteTxRx(
+                    self.port_handler, dynamixel.id, ADDR_TORQUE_ENABLE, 0
+                )
+                
+            # 2. Set the Operating Mode to Current-based Position Control (Value 5)
+            for dynamixel in self.dynamixels:
+                self.packet_handler.write1ByteTxRx(
+                    self.port_handler, dynamixel.id, ADDR_OPERATING_MODE, 5
+                )
+
+            # 3. Enable motor torque for all motors
+            for dynamixel in self.dynamixels:
+                self.packet_handler.write1ByteTxRx(
+                    self.port_handler, dynamixel.id, ADDR_TORQUE_ENABLE, 1
+                )
+
+        # Clear existing parameters
+        self.sync_write_pos.clearParam()
+        self.sync_write_current.clearParam()
+        
+        # Add goal positions and currents for all motors
+        for dynamixel, position, current in zip(self.dynamixels, positions, currents):
+            # Convert radians to raw position data (4 bytes)
+            raw_goal_pos = int(position * 180 / np.pi / 0.087891)
+            param_goal_position = [
+                (raw_goal_pos >> 0) & 0xff,
+                (raw_goal_pos >> 8) & 0xff,
+                (raw_goal_pos >> 16) & 0xff,
+                (raw_goal_pos >> 24) & 0xff,
+            ]
+            
+            # Convert current to raw data (2 bytes)
+            param_goal_current = [
+                (current >> 0) & 0xff,
+                (current >> 8) & 0xff,
+            ]
+            
+            # Add parameters to the group sync write objects
+            self.sync_write_pos.addParam(dynamixel.id, param_goal_position)
+            self.sync_write_current.addParam(dynamixel.id, param_goal_current)
+
+        # Transmit the data to all motors at once
+        dxl_comm_result_pos = self.sync_write_pos.txPacket()
+        dxl_comm_result_current = self.sync_write_current.txPacket()
+        
+        if dxl_comm_result_pos != COMM_SUCCESS:
+            print(f"Goal position sync write failed: {self.packet_handler.getTxRxResult(dxl_comm_result_pos)}")
+        if dxl_comm_result_current != COMM_SUCCESS:
+            print(f"Goal current sync write failed: {self.packet_handler.getTxRxResult(dxl_comm_result_current)}")
+            
+
+        print(f"Factr.spring_to: {time() - start}")
+
+    def spring_to_home(self, initialize=False) -> None:
         """Torque each motor to bias it toward the home position"""
 
         for dynamixel in self.dynamixels:
             if dynamixel.id in [1, 4]:
-                dynamixel.spring_to(0.0, 100)
+                dynamixel.spring_to(0.0, 60, initialize=initialize)
             elif dynamixel.id in [2]:
-                dynamixel.spring_to(0.0, 300)
+                dynamixel.spring_to(0.0, 100, initialize=initialize)
             else:
-                dynamixel.spring_to(0.0, 50)
+                dynamixel.spring_to(0.0, 30, initialize=initialize)
 
     @property
     def pos(self):
@@ -276,6 +353,8 @@ class Factr:
         Returns:
             List[float]: positions of each motor in radians
         """
+        start = time()
+
         positions: List[float] = []
 
         # Read the position of each motor in the group
@@ -303,6 +382,8 @@ class Factr:
                 position_radians_with_offset -= 2 * np.pi
 
             positions.append(position_radians_with_offset)
+
+        print(f"Factr.pos: {time() - start}")
 
         return positions
 
@@ -387,7 +468,7 @@ class FactrInterfaceNode(Node):
         super().__init__("factr_interface")
 
         self.follower_joint_state = None
-        self.follower_joint_angles = None
+        self.follower_joint_angles = np.zeros(8)
         self.follower_at_zero = False
         self.factr_and_follower_initially_synced = False
         self.zero_angles = np.zeros(8)
@@ -418,11 +499,41 @@ class FactrInterfaceNode(Node):
         input("Move FACTR to zero position, then press Enter...")
         self.factr.cal()
 
-        # Load position offsets from calibration.yaml
-        self.factr.calibrate_from_file()
-
         self.factr.spring_to_home()
 
+        self.factr.spring_to(
+            positions=[0.0 for i in range(8)],
+            currents=[30, 60, 30, 50, 30, 60, 30, 30],
+            initialize=True,
+        )
+
+        self.create_timer(0.01, self.spin_interface)
+
+    def set_gripper_pos(self, pos: float, max_effort=100.0):
+        """Send an action goal to set the gripper's position
+
+        0.0 = open
+        0.8 = close
+
+        Args:
+            pos (float): The requested position of the gripper
+            max_effort (float, optional): Maximum grip force (unitless). Defaults to 100.0.
+        """
+
+        start = time()
+
+        if pos > 0.8:
+            pos = 0.8
+        elif pos < 0.0:
+            pos = 0.0
+
+        command = GripperCommand.Goal()
+        command.command.position = pos
+        command.command.max_effort = max_effort
+
+        future_ = self.gripper_client.send_goal_async(command)
+
+        print(f"set_gripper_pos: {time() - start}")
 
     def joint_state_cb(self, msg: JointState) -> None:
         self.time_last_state_received = time()
@@ -489,7 +600,7 @@ class FactrInterfaceNode(Node):
         for motor in self.motors:
             print(motor.pos)
 
-        input("Press enter when ready to calibrate...")
+        input("Move to zero position, then press Enter...")
 
         for motor in self.motors:
             motor.cal()
@@ -511,7 +622,16 @@ class FactrInterfaceNode(Node):
 
         return follower_value
 
-    def spin_interface(self) -> None: ...
+    def spin_interface(self) -> None:
+
+        spring_positions = np.zeros(8)
+        spring_positions[-1] = self.follower_joint_angles[-1]
+        spring_currents = np.asarray([30, 60, 30, 50, 30, 60, 30, 30])
+
+        print(self.follower_joint_angles[-1], self.factr.pos[-1])
+        self.factr.spring_to(spring_positions, spring_currents)
+
+        self.set_gripper_pos(self.factr.pos[-1])
 
 
 def main(args=None):
