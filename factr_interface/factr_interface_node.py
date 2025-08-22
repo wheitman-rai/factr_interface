@@ -4,6 +4,7 @@
 # (c) 2025 RAI Institute
 # -----------------------------------------------------------------------------
 
+from functools import partial
 from io import TextIOWrapper
 import os
 from typing import List
@@ -24,7 +25,11 @@ import rclpy
 from rclpy.impl import rcutils_logger
 from rclpy.action import ActionClient
 from rclpy.node import Node, ParameterDescriptor, ParameterType
+from robot_descriptions.loaders.yourdfpy import load_robot_description
 from time import time, sleep
+import viser
+from viser.extras import ViserUrdf
+import yourdfpy
 
 
 # Messages
@@ -52,6 +57,7 @@ class Dynamixel:
         id: int,
         packet_handler: Protocol2PacketHandler,
         port_handler: PortHandler,
+        inverted=False,
     ):
 
         self.packet_handler = packet_handler
@@ -59,6 +65,7 @@ class Dynamixel:
         self.id = id
         self.offset_radians: float = 0.0  # "Zero" position (homing pos) of the motor
         self.logger = rcutils_logger.RcutilsLogger(name="factr")
+        self.inverted = inverted
 
         # Ping the motor
         dxl_model_number, dxl_comm_result, dxl_error = packet_handler.ping(
@@ -67,7 +74,7 @@ class Dynamixel:
         if dxl_comm_result != COMM_SUCCESS:
             if "no status packet" in str(packet_handler.getTxRxResult(dxl_comm_result)):
                 self.logger.error(
-                    f"Could not communicate with Dynamixel {self.id}. Is the motor plugged in and powered?"
+                    f"Could not communicate with Dynamixel {self.id}. Is the motor plugged in and powered? Is the baud rate correct?"
                 )
             else:
                 self.logger.error(f"{packet_handler.getTxRxResult(dxl_comm_result)}")
@@ -96,7 +103,9 @@ class Dynamixel:
         pos_degrees = pos_raw * 0.087891
         pos_radians = pos_degrees * np.pi / 180.0
         pos_radians_with_offset = pos_radians
-        return pos_radians_with_offset
+        return (
+            pos_radians_with_offset * -1 if self.inverted else pos_radians_with_offset
+        )
 
     def cal(self):
         """Calibrate the Dynamixel by setting its homing offset"""
@@ -222,7 +231,7 @@ class Factr:
         self,
         ids: List[int] = list(range(1, 9)),
         port: str = "/dev/ttyUSB0",
-        baud: int = 57600,
+        baud: int = 4000000,
     ):
 
         self.logger = rcutils_logger.RcutilsLogger(name="factr")
@@ -258,13 +267,17 @@ class Factr:
             LEN_GOAL_POSITION,
         )
 
-        self.sync_write_current = GroupSyncWrite(self.port_handler, self.packet_handler, ADDR_GOAL_CURRENT, 2)
+        self.sync_write_current = GroupSyncWrite(
+            self.port_handler, self.packet_handler, ADDR_GOAL_CURRENT, 2
+        )
+
+        self.inverted = [False, False, False, True, False, True, False, False]
 
         # Instantiate 8 Dynamixels
         self.dynamixels: List[Dynamixel] = []
-        for id in ids:
+        for id, inverted in zip(ids, self.inverted):
             self.dynamixels.append(
-                Dynamixel(id, self.packet_handler, self.port_handler)
+                Dynamixel(id, self.packet_handler, self.port_handler, inverted)
             )
 
             # Add the motor to the Sync Read Group
@@ -272,7 +285,6 @@ class Factr:
                 self.logger.error(f"Failed to add motor {id} to the sync read group")
 
     def spring_to(self, positions, currents, initialize=False):
-
         """
         Sets the goal position and goal current of all Dynamixels at once
         using GroupSyncWrite.
@@ -281,11 +293,8 @@ class Factr:
 
         if initialize:
             # 1. Disable torque before changing the operating mode for all motors
-            for dynamixel in self.dynamixels:
-                self.packet_handler.write1ByteTxRx(
-                    self.port_handler, dynamixel.id, ADDR_TORQUE_ENABLE, 0
-                )
-                
+            self.cut_torque()
+
             # 2. Set the Operating Mode to Current-based Position Control (Value 5)
             for dynamixel in self.dynamixels:
                 self.packet_handler.write1ByteTxRx(
@@ -301,24 +310,24 @@ class Factr:
         # Clear existing parameters
         self.sync_write_pos.clearParam()
         self.sync_write_current.clearParam()
-        
+
         # Add goal positions and currents for all motors
         for dynamixel, position, current in zip(self.dynamixels, positions, currents):
             # Convert radians to raw position data (4 bytes)
             raw_goal_pos = int(position * 180 / np.pi / 0.087891)
             param_goal_position = [
-                (raw_goal_pos >> 0) & 0xff,
-                (raw_goal_pos >> 8) & 0xff,
-                (raw_goal_pos >> 16) & 0xff,
-                (raw_goal_pos >> 24) & 0xff,
+                (raw_goal_pos >> 0) & 0xFF,
+                (raw_goal_pos >> 8) & 0xFF,
+                (raw_goal_pos >> 16) & 0xFF,
+                (raw_goal_pos >> 24) & 0xFF,
             ]
-            
+
             # Convert current to raw data (2 bytes)
             param_goal_current = [
-                (current >> 0) & 0xff,
-                (current >> 8) & 0xff,
+                (current >> 0) & 0xFF,
+                (current >> 8) & 0xFF,
             ]
-            
+
             # Add parameters to the group sync write objects
             self.sync_write_pos.addParam(dynamixel.id, param_goal_position)
             self.sync_write_current.addParam(dynamixel.id, param_goal_current)
@@ -326,14 +335,17 @@ class Factr:
         # Transmit the data to all motors at once
         dxl_comm_result_pos = self.sync_write_pos.txPacket()
         dxl_comm_result_current = self.sync_write_current.txPacket()
-        
-        if dxl_comm_result_pos != COMM_SUCCESS:
-            print(f"Goal position sync write failed: {self.packet_handler.getTxRxResult(dxl_comm_result_pos)}")
-        if dxl_comm_result_current != COMM_SUCCESS:
-            print(f"Goal current sync write failed: {self.packet_handler.getTxRxResult(dxl_comm_result_current)}")
-            
 
-        print(f"Factr.spring_to: {time() - start}")
+        if dxl_comm_result_pos != COMM_SUCCESS:
+            print(
+                f"Goal position sync write failed: {self.packet_handler.getTxRxResult(dxl_comm_result_pos)}"
+            )
+        if dxl_comm_result_current != COMM_SUCCESS:
+            print(
+                f"Goal current sync write failed: {self.packet_handler.getTxRxResult(dxl_comm_result_current)}"
+            )
+
+        # print(f"Factr.spring_to: {time() - start}")
 
     def spring_to_home(self, initialize=False) -> None:
         """Torque each motor to bias it toward the home position"""
@@ -346,6 +358,12 @@ class Factr:
             else:
                 dynamixel.spring_to(0.0, 30, initialize=initialize)
 
+    def cut_torque(self):
+        for dynamixel in self.dynamixels:
+            self.packet_handler.write1ByteTxRx(
+                self.port_handler, dynamixel.id, ADDR_TORQUE_ENABLE, 0
+            )
+
     @property
     def pos(self):
         """Returns the position of each motor in radians, accounting for offsets from calibration
@@ -355,6 +373,16 @@ class Factr:
         """
         start = time()
 
+        # Simple caching mechanism to use the last result if newer than x seconds
+        if (
+            hasattr(self, "time_since_last_pos_reading_")
+            and time() - self.time_since_last_pos_reading_ < 0.025
+        ):
+            return self.last_pos_reading_
+
+        else:
+            self.time_since_last_pos_reading_ = time()
+
         positions: List[float] = []
 
         # Read the position of each motor in the group
@@ -362,7 +390,7 @@ class Factr:
         if dxl_comm_result != COMM_SUCCESS:
             print(f"{self.packet_handler.getTxRxResult(dxl_comm_result)}")
 
-        for dynamixel in self.dynamixels:
+        for dynamixel, inverted in zip(self.dynamixels, self.inverted):
 
             raw_position = self.sync_read_group.getData(
                 dynamixel.id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
@@ -381,9 +409,14 @@ class Factr:
             elif position_radians_with_offset > np.pi:
                 position_radians_with_offset -= 2 * np.pi
 
+            if inverted:
+                position_radians_with_offset *= -1
+
             positions.append(position_radians_with_offset)
 
-        print(f"Factr.pos: {time() - start}")
+        # print(f"Factr.pos: {time() - start}")
+
+        self.last_pos_reading_ = positions
 
         return positions
 
@@ -459,6 +492,87 @@ class Factr:
                 )
 
 
+class Gui:
+
+    def __init__(self, start_cal_cb, finish_cal_cb):
+        self.server = viser.ViserServer()
+
+        self.cal_started = False
+
+        # Add a Franka to the scene
+
+        urdf = load_robot_description(
+            "panda_description",
+            load_meshes=True,
+            build_scene_graph=True,
+            load_collision_meshes=False,
+            build_collision_scene_graph=False,
+        )
+
+        urdf = yourdfpy.URDF.load(
+            "/home/wheitman/wheitman_ws/src/external/FACTR_Teleop/src/factr_teleop/factr_teleop/urdf/factr_teleop_franka.urdf",
+            build_scene_graph=True,
+            build_collision_scene_graph=False,
+            load_meshes=True,
+            load_collision_meshes=False,
+            filename_handler=partial(
+                yourdfpy.filename_handler_magic,
+                dir="/home/wheitman/wheitman_ws/src/external/FACTR_Teleop/src/factr_teleop/factr_teleop/urdf/",
+            ),
+        )
+
+        self.viser_urdf = ViserUrdf(
+            self.server,
+            urdf_or_path=urdf,
+            load_meshes=True,
+            load_collision_meshes=False,
+            collision_mesh_color_override=(1.0, 0.0, 0.0, 0.5),
+        )
+
+        self.cal_button = self.server.gui.add_button("Start Calibration")
+        self.explanatory_text = self.server.gui.add_markdown(
+            "Click the button to calibrate FACTR's joint angles"
+        )
+
+        initial_config: list[float] = []
+        for joint_name, (
+            lower,
+            upper,
+        ) in self.viser_urdf.get_actuated_joint_limits().items():
+            lower = lower if lower is not None else -np.pi
+            upper = upper if upper is not None else np.pi
+            initial_pos = 0.0 if lower < -0.1 and upper > 0.1 else (lower + upper) / 2.0
+            initial_config.append(initial_pos)
+
+        # Start in zero position until told otherwise
+        self.viser_urdf.update_cfg(np.zeros(7))
+
+        @self.cal_button.on_click
+        def _(_) -> None:
+            print("Button clicked!")
+
+            self.cal_started = not self.cal_started
+
+            if self.cal_started:  # Now in calibration mode
+                self.explanatory_text.content = "Move FACTR to match the zero configuration shown. Be sure it matches!"
+                self.cal_button.label = "Finish Calibration"
+                start_cal_cb()
+
+            else:  # Calibration just finished
+                self.cal_button.label = "Start Calibration"
+                self.explanatory_text.content = (
+                    "Click the button to calibrate FACTR's joint angles"
+                )
+                finish_cal_cb()
+
+    def update(self, config: np.ndarray):
+        if self.cal_started:
+            self.viser_urdf.update_cfg(np.zeros(7))
+            return  # Ignore current config, only show zero config
+
+        self.viser_urdf.update_cfg(config[:7])
+
+
 class FactrInterfaceNode(Node):
     """
     Bridges data from Dynamixel motors and robot arms (Franka, Kinova)
@@ -496,18 +610,32 @@ class FactrInterfaceNode(Node):
 
         self.factr = Factr()
 
-        input("Move FACTR to zero position, then press Enter...")
-        self.factr.cal()
+        self.gui = Gui(self.start_cal, self.finish_cal)
 
-        self.factr.spring_to_home()
+        # input("Move FACTR to zero position, then press Enter...")
+        # self.factr.cal()
 
-        self.factr.spring_to(
-            positions=[0.0 for i in range(8)],
-            currents=[30, 60, 30, 50, 30, 60, 30, 30],
-            initialize=True,
-        )
+        # self.factr.spring_to_home()
+
+        # self.factr.spring_to(
+        #     positions=[0.0 for i in range(8)],
+        #     currents=[30, 60, 30, 50, 30, 60, 30, 30],
+        #     initialize=True,
+        # )
 
         self.create_timer(0.01, self.spin_interface)
+
+    def start_cal(self):
+
+        # Cut FACTR torque
+        self.factr.cut_torque()
+
+        # Show zero pos FACTR in GUI
+        pass
+
+    def finish_cal(self):
+
+        self.factr.cal()
 
     def set_gripper_pos(self, pos: float, max_effort=100.0):
         """Send an action goal to set the gripper's position
@@ -532,8 +660,6 @@ class FactrInterfaceNode(Node):
         command.command.max_effort = max_effort
 
         future_ = self.gripper_client.send_goal_async(command)
-
-        print(f"set_gripper_pos: {time() - start}")
 
     def joint_state_cb(self, msg: JointState) -> None:
         self.time_last_state_received = time()
@@ -605,10 +731,6 @@ class FactrInterfaceNode(Node):
         for motor in self.motors:
             motor.cal()
 
-        while True:
-            for motor in self.motors:
-                print(motor.pos)
-
     def map(self, factr_min, factr_max, follower_min, follower_max, value) -> float:
         factr_range = factr_max - factr_min
 
@@ -626,12 +748,37 @@ class FactrInterfaceNode(Node):
 
         spring_positions = np.zeros(8)
         spring_positions[-1] = self.follower_joint_angles[-1]
+        spring_positions[-2] = self.follower_joint_angles[-2]
         spring_currents = np.asarray([30, 60, 30, 50, 30, 60, 30, 30])
 
-        print(self.follower_joint_angles[-1], self.factr.pos[-1])
-        self.factr.spring_to(spring_positions, spring_currents)
+        # self.factr.spring_to(spring_positions, spring_currents)
+
+        self.gui.update(self.factr.pos)
 
         self.set_gripper_pos(self.factr.pos[-1])
+
+        # Now set the other target joint positions
+        command = JointTrajectory()
+        command_point = JointTrajectoryPoint()
+        command.joint_names = [f"joint_{n}" for n in range(1, 8)]
+
+        command_point.positions = [0.0 for i in range(7)]
+        command_point.positions[-1] = self.factr.pos[-2]
+
+        max_joint_angle_error = np.max(
+            np.abs(np.asarray(self.follower_joint_angles) - np.asarray(self.factr.pos))
+        )
+
+        time_from_start = max_joint_angle_error * 1.0
+
+        command_point.time_from_start.sec = int(np.floor(time_from_start))
+        command_point.time_from_start.nanosec = int(
+            (time_from_start - np.floor(time_from_start)) * 1e9
+        )
+
+        command.points = [command_point]
+
+        # self.joint_command_pub.publish(command)
 
 
 def main(args=None):
