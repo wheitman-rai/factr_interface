@@ -365,11 +365,11 @@ class Factr:
             )
 
     @property
-    def pos(self):
+    def pos(self) -> np.ndarray:
         """Returns the position of each motor in radians, accounting for offsets from calibration
 
         Returns:
-            List[float]: positions of each motor in radians
+            np.ndarray: positions of each motor in radians
         """
         start = time()
 
@@ -392,7 +392,7 @@ class Factr:
 
         for dynamixel, inverted in zip(self.dynamixels, self.inverted):
 
-            raw_position = self.sync_read_group.getData(
+            raw_position: int = self.sync_read_group.getData(
                 dynamixel.id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
             )
 
@@ -416,9 +416,14 @@ class Factr:
 
         # print(f"Factr.pos: {time() - start}")
 
-        self.last_pos_reading_ = positions
+        positions_np = np.asarray(positions)
 
-        return positions
+        # Remap the gripper pos
+        positions_np[-1] += 0.8
+
+        self.last_pos_reading_ = positions_np
+
+        return positions_np
 
     def calibrate_from_file(self) -> None:
         """Load position offsets from calibration.yaml"""
@@ -533,6 +538,10 @@ class Gui:
         self.explanatory_text = self.server.gui.add_markdown(
             "Click the button to calibrate FACTR's joint angles"
         )
+        self.freq_text = self.server.gui.add_markdown("null Hz")
+        self.gripper_pos_bar = self.server.gui.add_progress_bar(0.0)
+        self.gripper_pos_bar.label = "Gripper"
+        self.gripper_pos_bar.hint = "Open/Closed"
 
         initial_config: list[float] = []
         for joint_name, (
@@ -572,6 +581,11 @@ class Gui:
 
         self.viser_urdf.update_cfg(config[:7])
 
+        self.gripper_pos_bar.value = config[-1] * (100 / 0.8)  # 0.8 = closed
+
+    def record_freq(self, new_freq):
+        self.freq_text.content = f"{int(new_freq)} Hz"
+
 
 class FactrInterfaceNode(Node):
     """
@@ -596,7 +610,7 @@ class FactrInterfaceNode(Node):
         )
 
         self.joint_state_pub = self.create_publisher(
-            JointState, "/kinova/joint_commands", 10
+            JointState, "/factr/joint_state", 10
         )
 
         self.joint_command_pub = self.create_publisher(
@@ -612,6 +626,9 @@ class FactrInterfaceNode(Node):
 
         self.gui = Gui(self.start_cal, self.finish_cal)
 
+        self.HISTORY_WINDOW_LEN = 1000
+        self.spin_times: list[float] = []
+
         # input("Move FACTR to zero position, then press Enter...")
         # self.factr.cal()
 
@@ -623,7 +640,8 @@ class FactrInterfaceNode(Node):
         #     initialize=True,
         # )
 
-        self.create_timer(0.01, self.spin_interface)
+        CONTROLLER_HZ = 500  # TODO WSH: Parameterize
+        self.create_timer(1.0 / CONTROLLER_HZ, self.spin_interface)
 
     def start_cal(self):
 
@@ -746,6 +764,8 @@ class FactrInterfaceNode(Node):
 
     def spin_interface(self) -> None:
 
+        start = time()
+
         spring_positions = np.zeros(8)
         spring_positions[-1] = self.follower_joint_angles[-1]
         spring_positions[-2] = self.follower_joint_angles[-2]
@@ -754,6 +774,8 @@ class FactrInterfaceNode(Node):
         # self.factr.spring_to(spring_positions, spring_currents)
 
         self.gui.update(self.factr.pos)
+
+        print(f"Gripper pos: {self.factr.pos[-1]}")
 
         self.set_gripper_pos(self.factr.pos[-1])
 
@@ -779,6 +801,24 @@ class FactrInterfaceNode(Node):
         command.points = [command_point]
 
         # self.joint_command_pub.publish(command)
+        self.publish_factr_joint_state()
+
+        self.spin_times.append(time() - start)
+
+        if len(self.spin_times) >= self.HISTORY_WINDOW_LEN:
+
+            freq = 1 / np.mean(self.spin_times)
+            self.gui.record_freq(freq)
+            self.spin_times.clear()
+
+    def publish_factr_joint_state(self):
+
+        msg = JointState()
+
+        msg.position = self.factr.pos.tolist()
+        msg.header.stamp = self.get_clock().now().to_msg()
+
+        self.joint_state_pub.publish(msg)
 
 
 def main(args=None):
