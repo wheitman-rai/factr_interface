@@ -7,7 +7,7 @@
 from functools import partial
 from io import TextIOWrapper
 import os
-from typing import List
+import subprocess
 import yaml
 
 from ament_index_python.packages import get_package_share_directory
@@ -19,8 +19,17 @@ from dynamixel_sdk import (
     GroupSyncRead,
     GroupSyncWrite,
 )
+from dynamixel_sdk.robotis_def import (
+    COMM_SUCCESS,
+    DXL_HIBYTE,
+    DXL_HIWORD,
+    DXL_LOBYTE,
+    DXL_LOWORD,
+)
+
 import numpy as np
 import math
+import pinocchio as pin
 import rclpy
 from rclpy.impl import rcutils_logger
 from rclpy.action import ActionClient
@@ -48,6 +57,13 @@ ADDR_CURRENT_LIMIT = 38  # This address may vary by model.
 LEN_PRESENT_POSITION = 4  # 4 bytes for position data
 LEN_GOAL_POSITION = 4  # 4 bytes for position data
 ADDR_TORQUE_ENABLE = 64
+
+# Taken from original paper code
+# Converts from Nm to mA
+TORQUE_TO_CURRENT_MAPPING = {
+    "XC330_T288_T": 1158.73,
+    "XM430_W210_T": 1000 / 2.69,
+}
 
 
 class Dynamixel:
@@ -115,9 +131,9 @@ class Dynamixel:
             self.port_handler, self.id, ADDR_TORQUE_ENABLE, 0
         )
 
-        # 2. Set the Operating Mode to Current-based Position Control (Value 5)
+        # 2. Set the Operating Mode to Current Control (Value 0)
         dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-            self.port_handler, self.id, ADDR_OPERATING_MODE, 5
+            self.port_handler, self.id, ADDR_OPERATING_MODE, 0
         )
         if dxl_comm_result != COMM_SUCCESS:
             print(self.packet_handler.getTxRxResult(dxl_comm_result))
@@ -179,49 +195,9 @@ class Dynamixel:
                     f"Motor {self.id} has position {dxl_present_position} after calibration!"
                 )
 
-    def spring_to(
-        self, goal_pos_radians: float, goal_current_ma: int = 100, initialize=False
-    ):
-        """
-        Sets the goal current and goal pose of a Dynamixel, allowing virtual springs
-
-
-
-        """
-
-        if initialize:
-            # 1. Disable torque before changing the operating mode
-            self.packet_handler.write1ByteTxRx(
-                self.port_handler, self.id, ADDR_TORQUE_ENABLE, 0
-            )
-
-            # 2. Set the Operating Mode to Current-based Position Control (Value 5)
-            # This value may need to be stored in the EEPROM and may require a reboot
-            # to take effect permanently, but can be set in RAM for a single session.
-            dxl_comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
-                self.port_handler, self.id, ADDR_OPERATING_MODE, 5
-            )
-            if dxl_comm_result != COMM_SUCCESS:
-                self.logger.error(self.packet_handler.getTxRxResult(dxl_comm_result))
-            elif dxl_error != 0:
-                self.logger.error(self.packet_handler.getRxPacketError(dxl_error))
-
-            # 3. Enable motor torque
-            self.packet_handler.write1ByteTxRx(
-                self.port_handler, self.id, ADDR_TORQUE_ENABLE, 1
-            )
-
-        # 4. Set a goal position and goal current
-        # Range for goal current is typically 0 to 2047 (relative to maximum current)
-
-        # Write the Goal Position
-        raw_goal_pos = int(goal_pos_radians * 180 / np.pi / 0.087891)
-        self.packet_handler.write4ByteTxRx(
-            self.port_handler, self.id, ADDR_GOAL_POSITION, raw_goal_pos
-        )
-        # Write the Goal Current
-        self.packet_handler.write2ByteTxRx(
-            self.port_handler, self.id, ADDR_GOAL_CURRENT, goal_current_ma
+    def set_operating_mode(self, mode: int):
+        self.packet_handler.write1ByteTxRx(
+            self.port_handler, self.id, ADDR_TORQUE_ENABLE, mode
         )
 
 
@@ -229,14 +205,16 @@ class Factr:
 
     def __init__(
         self,
-        ids: List[int] = list(range(1, 9)),
-        port: str = "/dev/ttyUSB0",
+        ids: list[int] = list(range(1, 9)),
+        port: str = "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAA0AKR-if00-port0",
         baud: int = 4000000,
     ):
 
         self.logger = rcutils_logger.RcutilsLogger(name="factr")
+        self._torque_enabled = False
 
         # Establish a connection
+        self.port = port
         self.port_handler = PortHandler(port)
         self.packet_handler = Protocol2PacketHandler()
 
@@ -271,10 +249,73 @@ class Factr:
             self.port_handler, self.packet_handler, ADDR_GOAL_CURRENT, 2
         )
 
+        # Describes which motors' axes of rotation are flipped w.r.t. the URDF.
         self.inverted = [False, False, False, True, False, True, False, False]
 
+        # Used to convert torque to mA
+        servo_types = [
+            "XC330_T288_T",
+            "XM430_W210_T",
+            "XC330_T288_T",
+            "XM430_W210_T",
+            "XC330_T288_T",
+            "XC330_T288_T",
+            "XC330_T288_T",
+            "XC330_T288_T",
+        ]
+        self.torque_to_current_map = np.array(
+            [TORQUE_TO_CURRENT_MAPPING[servo] for servo in servo_types]
+        )
+
+        self.set_up_motors(ids)
+
+    def check_usb_latency(self):
+        """
+        TAKEN FROM ORIGINAL PAPER CODE
+        checks of the latency timer on ttyUSB of the corresponding port is 1
+        if it is not 1, the control loop cannot run at above 200 Hz, which will
+        cause extremely undesirable behaviour for the leader arm. If the latency
+        timer is not 1, one can set it to 1 as follows:
+        echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB{NUM}/latency_timer
+        """
+
+        base_path = "/dev/serial/by-id/"
+        full_path = os.path.join(base_path, self.port)
+        if not os.path.exists(full_path):
+            raise Exception(f"Port '{self.port}' does not exist in {base_path}.")
+        try:
+            resolved_path = os.readlink(full_path)
+            actual_device = os.path.basename(resolved_path)
+            if not actual_device.startswith("ttyUSB"):
+                raise Exception(
+                    f"The port '{self.port}' does not correspond to a ttyUSB device. It links to {resolved_path}."
+                )
+        except Exception as e:
+            raise Exception(
+                f"Unable to resolve the symbolic link for '{self.port}'. {e}"
+            )
+
+        ttyUSBx = actual_device
+        command = f"cat /sys/bus/usb-serial/devices/{ttyUSBx}/latency_timer"
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, check=True
+        )
+        ttyUSB_latency_timer = int(result.stdout)
+        if ttyUSB_latency_timer != 1:
+            raise Exception(
+                f"Please ensure the latency timer of {ttyUSBx} is 1. Run: \n \
+                echo 1 | sudo tee /sys/bus/usb-serial/devices/{ttyUSBx}/latency_timer"
+            )
+
+    def set_up_motors(self, ids: list[int]) -> None:
+        """
+        Initializes and configures the Dynamixel motors for communication.
+        Opens the serial port, sets the baud rate, and adds each motor ID to the sync read group.
+        Logs errors if connection or configuration fails.
+        """
+
         # Instantiate 8 Dynamixels
-        self.dynamixels: List[Dynamixel] = []
+        self.dynamixels: list[Dynamixel] = []
         for id, inverted in zip(ids, self.inverted):
             self.dynamixels.append(
                 Dynamixel(id, self.packet_handler, self.port_handler, inverted)
@@ -284,85 +325,84 @@ class Factr:
             if not self.sync_read_group.addParam(id):
                 self.logger.error(f"Failed to add motor {id} to the sync read group")
 
-    def spring_to(self, positions, currents, initialize=False):
-        """
-        Sets the goal position and goal current of all Dynamixels at once
-        using GroupSyncWrite.
-        """
-        start = time()
+        self.check_usb_latency()
 
-        if initialize:
-            # 1. Disable torque before changing the operating mode for all motors
-            self.cut_torque()
+        self.set_operating_mode(0)  # Current mode
 
-            # 2. Set the Operating Mode to Current-based Position Control (Value 5)
-            for dynamixel in self.dynamixels:
-                self.packet_handler.write1ByteTxRx(
-                    self.port_handler, dynamixel.id, ADDR_OPERATING_MODE, 5
-                )
+    def set_operating_mode(self, mode: int):
 
-            # 3. Enable motor torque for all motors
-            for dynamixel in self.dynamixels:
-                self.packet_handler.write1ByteTxRx(
-                    self.port_handler, dynamixel.id, ADDR_TORQUE_ENABLE, 1
-                )
-
-        # Clear existing parameters
-        self.sync_write_pos.clearParam()
-        self.sync_write_current.clearParam()
-
-        # Add goal positions and currents for all motors
-        for dynamixel, position, current in zip(self.dynamixels, positions, currents):
-            # Convert radians to raw position data (4 bytes)
-            raw_goal_pos = int(position * 180 / np.pi / 0.087891)
-            param_goal_position = [
-                (raw_goal_pos >> 0) & 0xFF,
-                (raw_goal_pos >> 8) & 0xFF,
-                (raw_goal_pos >> 16) & 0xFF,
-                (raw_goal_pos >> 24) & 0xFF,
-            ]
-
-            # Convert current to raw data (2 bytes)
-            param_goal_current = [
-                (current >> 0) & 0xFF,
-                (current >> 8) & 0xFF,
-            ]
-
-            # Add parameters to the group sync write objects
-            self.sync_write_pos.addParam(dynamixel.id, param_goal_position)
-            self.sync_write_current.addParam(dynamixel.id, param_goal_current)
-
-        # Transmit the data to all motors at once
-        dxl_comm_result_pos = self.sync_write_pos.txPacket()
-        dxl_comm_result_current = self.sync_write_current.txPacket()
-
-        if dxl_comm_result_pos != COMM_SUCCESS:
-            print(
-                f"Goal position sync write failed: {self.packet_handler.getTxRxResult(dxl_comm_result_pos)}"
-            )
-        if dxl_comm_result_current != COMM_SUCCESS:
-            print(
-                f"Goal current sync write failed: {self.packet_handler.getTxRxResult(dxl_comm_result_current)}"
-            )
-
-        # print(f"Factr.spring_to: {time() - start}")
-
-    def spring_to_home(self, initialize=False) -> None:
-        """Torque each motor to bias it toward the home position"""
+        self.disable_torque()
 
         for dynamixel in self.dynamixels:
-            if dynamixel.id in [1, 4]:
-                dynamixel.spring_to(0.0, 60, initialize=initialize)
-            elif dynamixel.id in [2]:
-                dynamixel.spring_to(0.0, 100, initialize=initialize)
-            else:
-                dynamixel.spring_to(0.0, 30, initialize=initialize)
+            dynamixel.set_operating_mode(mode)
 
-    def cut_torque(self):
+        self.enable_torque()
+
+    def disable_torque(self):
+        # TODO WSH: Optimize with write sync group
         for dynamixel in self.dynamixels:
             self.packet_handler.write1ByteTxRx(
                 self.port_handler, dynamixel.id, ADDR_TORQUE_ENABLE, 0
             )
+
+        self._torque_enabled = False
+
+    def enable_torque(self):
+        # TODO WSH: Optimize with write sync group
+        for dynamixel in self.dynamixels:
+            self.packet_handler.write1ByteTxRx(
+                self.port_handler, dynamixel.id, ADDR_TORQUE_ENABLE, 1
+            )
+        self._torque_enabled = True
+
+    def set_torques(self, torques: np.ndarray) -> None:
+        """Sets the torque of each motor in the chain. Maps to currents.
+
+        Args:
+            torques (np.ndarray): Torques WITHOUT accounting for inversion. Direction inversion is handled here!
+        """
+
+        if len(torques) != len(self.dynamixels):
+            self.logger.error(
+                f"Got {len(torques)} torques but FACTR has {len(self.dynamixels)} motors. Torques won't be set."
+            )
+            return
+        currents = self.torque_to_current_map * torques
+        self.set_currents(currents)
+
+    def set_currents(self, currents: np.ndarray):
+
+        if len(currents) != len(self.dynamixels):
+            raise ValueError("The length of currents must match the number of servos")
+        if not self._torque_enabled:
+            raise RuntimeError("Torque must be enabled to set currents")
+
+        # Clip them to a reasonable range
+        if np.max(currents) > 900:
+            self.logger.warning(
+                f"Currents for motor {np.argmax(currents) + 1} was {np.max(currents)}"
+            )
+        if np.min(currents) < -900:
+            self.logger.warning(
+                f"Currents for motor {np.argmax(currents) + 1} was {np.min(currents)}"
+            )
+
+        currents = np.clip(currents, -900, 900)
+
+        currents = np.clip(currents, -900, 900)
+        for dynamixel, current in zip(self.dynamixels, currents):
+            current_value = int(current)
+
+            param_goal_current = [DXL_LOBYTE(current_value), DXL_HIBYTE(current_value)]
+
+            if not self.sync_write_current.addParam(dynamixel.id, param_goal_current):
+                raise RuntimeError(
+                    f"Failed to set current for Dynamixel with ID {dynamixel.id}"
+                )
+        dxl_comm_result = self.sync_write_current.txPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            raise RuntimeError("Failed to syncwrite goal current")
+        self.sync_write_current.clearParam()
 
     @property
     def pos(self) -> np.ndarray:
@@ -383,7 +423,7 @@ class Factr:
         else:
             self.time_since_last_pos_reading_ = time()
 
-        positions: List[float] = []
+        positions: list[float] = []
 
         # Read the position of each motor in the group
         dxl_comm_result = self.sync_read_group.txRxPacket()
@@ -604,7 +644,11 @@ class FactrInterfaceNode(Node):
         self.declare_parameters(
             "",
             [
-                ("serial_port", "/dev/ttyUSB0", ParameterDescriptor()),
+                (
+                    "serial_port",
+                    "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTAA0AKR-if00-port0",
+                    ParameterDescriptor(),
+                ),
                 ("dynamixel_ids", list(range(1, 9)), ParameterDescriptor()),
             ],
         )
@@ -626,6 +670,17 @@ class FactrInterfaceNode(Node):
 
         self.gui = Gui(self.start_cal, self.finish_cal)
 
+        urdf_path = "/home/wheitman/wheitman_ws/src/factr_interface/urdf/factr_teleop_franka.urdf"
+
+        # 1. Load the robot model from the URDF file
+        self.model, _, _ = pin.buildModelsFromUrdf(
+            filename=urdf_path,
+            package_dirs="/home/wheitman/wheitman_ws/src/factr_interface/urdf",
+        )
+        self.model_data = (
+            self.model.createData()
+        )  # The data structure for the dynamics model
+
         self.HISTORY_WINDOW_LEN = 1000
         self.spin_times: list[float] = []
 
@@ -643,10 +698,28 @@ class FactrInterfaceNode(Node):
         CONTROLLER_HZ = 500  # TODO WSH: Parameterize
         self.create_timer(1.0 / CONTROLLER_HZ, self.spin_interface)
 
+    def get_gravity_torques(self):
+
+        # Define the robot's state: joint positions, velocities, and accelerations
+        # For gravity compensation, velocities and accelerations are zero.
+        q = self.factr.pos[:-1]  # Ignore the gripper position
+        # q = np.zeros(self.model.nv)  # Joint configuration (e.g., 45 and 90 degrees)
+        # q[1] = np.pi / 2
+        v = np.zeros(self.model.nv)  # Zero joint velocities
+        a = np.zeros(self.model.nv)  # Zero joint accelerations
+
+        # Calculate the required inverse dynamics torques using RNEA
+        # The pin.rnea function computes the full inverse dynamics equation:
+        # tau = M(q) * a + C(q, v) * v + G(q)
+        # Since 'v' and 'a' are zero, the result is simply the gravity vector G(q).
+        torques = pin.rnea(self.model, self.model_data, q, v, a)
+
+        return torques
+
     def start_cal(self):
 
         # Cut FACTR torque
-        self.factr.cut_torque()
+        self.factr.disable_torque()
 
         # Show zero pos FACTR in GUI
         pass
@@ -655,7 +728,7 @@ class FactrInterfaceNode(Node):
 
         self.factr.cal()
 
-    def set_gripper_pos(self, pos: float, max_effort=100.0):
+    def set_follower_gripper_pos(self, pos: float, max_effort=100.0):
         """Send an action goal to set the gripper's position
 
         0.0 = open
@@ -703,52 +776,6 @@ class FactrInterfaceNode(Node):
 
         self.follower_at_zero = np.linalg.norm(self.follower_joint_angles) < 1.0
 
-    def set_up_motors(self) -> None:
-        """
-        Initializes and configures the Dynamixel motors for communication.
-        Opens the serial port, sets the baud rate, and adds each motor ID to the sync read group.
-        Logs errors if connection or configuration fails.
-        """
-
-        self.port = self.get_parameter("serial_port").value
-        self.dynamixel_ids: List[int] = self.get_parameter("dynamixel_ids").value  # type: ignore
-
-        self.port_handler = PortHandler(self.port)  # TODO WSH: Parameterize
-        self.packet_handler: Protocol2PacketHandler = PacketHandler(protocol_version=2.0)  # type: ignore
-        self.sync_read_group = GroupSyncRead(
-            self.port_handler,
-            self.packet_handler,
-            ADDR_PRESENT_POSITION,
-            LEN_PRESENT_POSITION,
-        )
-
-        self.sync_write_group = GroupSyncWrite(
-            self.port_handler,
-            self.packet_handler,
-            ADDR_GOAL_POSITION,
-            LEN_GOAL_POSITION,
-        )
-
-        if self.port_handler.openPort():
-            print(f"Successfully connected to FACTR on port {self.port}")
-        else:
-            self.get_logger().error(f"Could not connect to FACTR on port {self.port}")
-
-        if not self.port_handler.setBaudRate(57600):
-            self.get_logger().error(f"Could not set baud rate on port {self.port}")
-
-        self.motors = [
-            Dynamixel(id, self.packet_handler, self.port_handler) for id in range(1, 9)
-        ]
-
-        for motor in self.motors:
-            print(motor.pos)
-
-        input("Move to zero position, then press Enter...")
-
-        for motor in self.motors:
-            motor.cal()
-
     def map(self, factr_min, factr_max, follower_min, follower_max, value) -> float:
         factr_range = factr_max - factr_min
 
@@ -766,20 +793,19 @@ class FactrInterfaceNode(Node):
 
         start = time()
 
-        spring_positions = np.zeros(8)
-        spring_positions[-1] = self.follower_joint_angles[-1]
-        spring_positions[-2] = self.follower_joint_angles[-2]
-        spring_currents = np.asarray([30, 60, 30, 50, 30, 60, 30, 30])
-
-        # self.factr.spring_to(spring_positions, spring_currents)
-
         self.gui.update(self.factr.pos)
 
-        print(f"Gripper pos: {self.factr.pos[-1]}")
+        # GRAVITY COMP & FORCE FEEDBACK
+        GRAVITY_STRENGTH = 0.5
+        tau_g = self.get_gravity_torques() * GRAVITY_STRENGTH
+        print(tau_g)
 
-        self.set_gripper_pos(self.factr.pos[-1])
+        gripper_torque = 0.0
 
-        # Now set the other target joint positions
+        self.factr.set_torques(np.concatenate([tau_g, [gripper_torque]], axis=0))
+
+        # PUBLISH COMMAND TO FOLLOWER
+        self.set_follower_gripper_pos(self.factr.pos[-1])
         command = JointTrajectory()
         command_point = JointTrajectoryPoint()
         command.joint_names = [f"joint_{n}" for n in range(1, 8)]
@@ -803,10 +829,10 @@ class FactrInterfaceNode(Node):
         # self.joint_command_pub.publish(command)
         self.publish_factr_joint_state()
 
+        # PROFILING/TIMING CALCULATION
         self.spin_times.append(time() - start)
 
         if len(self.spin_times) >= self.HISTORY_WINDOW_LEN:
-
             freq = 1 / np.mean(self.spin_times)
             self.gui.record_freq(freq)
             self.spin_times.clear()
@@ -827,12 +853,23 @@ def main(args=None):
 
     node = FactrInterfaceNode()
 
-    rclpy.spin(node)
+    try:
 
-    # Destroy the node explicitly
-    node.destroy_node()
+        rclpy.spin(node)
 
-    rclpy.shutdown()
+    finally:
+
+        logger = rcutils_logger.RcutilsLogger(name="factr")
+        for i in range(3):
+            logger.info(f"Disabling torque in {3-i}")
+            sleep(1.0)
+        logger.info("Disabling torque. Goodbye.")
+        node.factr.disable_torque()
+
+        # Destroy the node explicitly
+        node.destroy_node()
+
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
