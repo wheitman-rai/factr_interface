@@ -22,6 +22,7 @@ import numpy as np
 
 import rclpy
 from factr_interface.factr_teleop import Factr
+from gui import Gui
 
 
 class FACTRTeleopGravComp(Factr):
@@ -33,6 +34,7 @@ class FACTRTeleopGravComp(Factr):
 
     def __init__(self):
         super().__init__()
+        self.gui = Gui()
 
     def set_up_communication(self):
         pass
@@ -49,6 +51,14 @@ class FACTRTeleopGravComp(Factr):
         pass
 
     def update_communication(self, leader_arm_pos, leader_gripper_pos):
+        """
+        Transmit data from the leader (FACTR) to the follower (Franka).
+        Also update the Viser UI
+        """
+
+        # Update the GUI
+        self.gui.update(leader_arm_pos, leader_gripper_pos)
+
         pass
 
 

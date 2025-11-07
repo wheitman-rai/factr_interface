@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 
 from rclpy.node import Node
 from factr_interface.dynamixel.driver import DynamixelDriver
+from dynamixel_sdk.robotis_def import COMM_SUCCESS
 
 
 def find_ttyusb(port_name):
@@ -138,11 +139,145 @@ class Factr(Node, ABC):
         self.set_up_communication()
 
         # calibrate the leader arm joints before starting
-        self._get_dynamixel_offsets()
+        # self._get_dynamixel_offsets()
+        self._set_homing_offsets_in_docked_position()
         # ensure the leader and the follower arms have the same joint positions before starting
         self._match_start_pos()
         # start the control loop
         self.timer = self.create_timer(self.dt, self.control_loop_callback)
+
+    def _set_homing_offsets_in_docked_position(self):
+        """
+        Set the homing offsets of each dynamixel such that the resultant position readings are:
+
+        [0, -1.52, 0, -3.14, 0, 1.52, 1.52] (calibration_joint_pos in config.yaml)
+
+        Should replace the _get_dynamixel_offsets() function by saving offset data to the EEPROMs directly.
+
+        Before calling this function, manually place the leader arm in the calibration position.
+        """
+        ADDR_HOMING_OFFSET = 20
+
+        # Ensure torque is disabled before writing to EEPROM
+        torque_was_enabled = self.driver.torque_enabled
+        if torque_was_enabled:
+            self.driver.set_torque_mode(False)
+
+        # Step 1: First, set all homing offsets to zero to get raw positions
+        self.get_logger().info("Clearing existing homing offsets...")
+        for i in range(self.num_motors):
+            joint_id = i + 1
+            dxl_comm_result, dxl_error = self.driver._packetHandler.write4ByteTxRx(
+                self.driver._portHandler, joint_id, ADDR_HOMING_OFFSET, 0
+            )
+
+            if dxl_comm_result != COMM_SUCCESS or dxl_error != 0:
+                raise RuntimeError(
+                    f"Failed to clear homing offset for Dynamixel ID {joint_id}. "
+                    f"Comm result: {dxl_comm_result}, Error: {dxl_error}"
+                )
+
+        # Warm up the driver after clearing offsets
+        for _ in range(10):
+            self.driver.get_positions_and_velocities()
+
+        # Step 2: Get current positions (where Dynamixels think they are with zero offset)
+        curr_joints, _ = self.driver.get_positions_and_velocities()
+
+        # Step 3: Calculate error between current reading and actual calibration position
+        # We need to find the offset that brings the current reading to the target,
+        # accounting for multi-turn capability (positions can be > 2π)
+
+        homing_offsets = []
+        for i in range(self.num_motors):
+            if i < self.num_arm_joints:
+                # For arm joints
+                current_reading = curr_joints[i] * self.joint_signs[i]
+                target_reading = self.calibration_joint_pos[i]
+
+                # Find the error, wrapping to the nearest equivalent angle
+                # This handles the case where current_reading might be multiple revolutions away
+                raw_error = target_reading - current_reading
+
+                # Wrap error to [-π, π] by finding the equivalent angle closest to 0
+                # This assumes the arm is within ±π of the target (within 180 degrees)
+                wrapped_error = np.arctan2(np.sin(raw_error), np.cos(raw_error))
+
+                # Sanity check: if the wrapped error is large, the arm might not be
+                # in the calibration position
+                if abs(wrapped_error) > np.pi / 2:  # More than 90 degrees off
+                    self.get_logger().warn(
+                        f"Joint {i+1} appears to be {np.degrees(abs(wrapped_error)):.1f} degrees "
+                        f"away from calibration position. Please verify the arm is correctly positioned."
+                    )
+
+                # The homing offset should correct this error
+                offset_rad = wrapped_error / self.joint_signs[i]
+            else:
+                # For gripper, set it to read 0 at current position
+                offset_rad = -curr_joints[i]
+
+            homing_offsets.append(offset_rad)
+
+        # Step 4: Write homing offsets to EEPROM
+        for i, offset_rad in enumerate(homing_offsets):
+            # Convert offset from radians to Dynamixel units (1 unit = pi/2048 radians)
+            offset_units = int(offset_rad * 2048.0 / np.pi)
+
+            joint_id = i + 1
+            dxl_comm_result, dxl_error = self.driver._packetHandler.write4ByteTxRx(
+                self.driver._portHandler, joint_id, ADDR_HOMING_OFFSET, offset_units
+            )
+
+            if dxl_comm_result != COMM_SUCCESS or dxl_error != 0:
+                raise RuntimeError(
+                    f"Failed to set homing offset for Dynamixel ID {joint_id}. "
+                    f"Comm result: {dxl_comm_result}, Error: {dxl_error}"
+                )
+
+            self.get_logger().info(
+                f"Set homing offset for joint {joint_id}: {offset_rad:.4f} rad ({offset_units} units)"
+            )
+
+        # Step 5: Read positions again after writing homing offsets
+        self.get_logger().info("Verifying homing offsets...")
+        for _ in range(10):
+            self.driver.get_positions_and_velocities()
+        new_joints, _ = self.driver.get_positions_and_velocities()
+
+        # Step 6: Verify that the error is now small
+        max_error = 0.0
+        for i in range(self.num_arm_joints):
+            current_reading = new_joints[i] * self.joint_signs[i]
+            # Wrap current reading to [-π, π]
+            current_reading = np.arctan2(
+                np.sin(current_reading), np.cos(current_reading)
+            )
+
+            target_reading = self.calibration_joint_pos[i]
+            # Wrap target reading to [-π, π] as well for consistency
+            target_reading = np.arctan2(np.sin(target_reading), np.cos(target_reading))
+
+            # Calculate wrapped error
+            error = target_reading - current_reading
+            error_rad = abs(np.arctan2(np.sin(error), np.cos(error)))
+            max_error = max(max_error, error_rad)
+
+            assert error_rad < 0.1, (
+                f"Joint {i+1} homing offset verification failed. "
+                f"Error: {error_rad:.4f} rad ({np.degrees(error_rad):.2f} degrees). "
+                f"Expected: {target_reading:.4f}, Got: {current_reading:.4f}"
+            )
+
+        # Re-enable torque if it was previously enabled
+        if torque_was_enabled:
+            self.driver.set_torque_mode(True)
+
+        self.get_logger().info(
+            f"Successfully set and verified homing offsets for all joints. "
+            f"Max error: {max_error:.4f} rad ({np.degrees(max_error):.2f} degrees). "
+            f"The offsets are now stored in EEPROM and will persist across power cycles."
+        )
 
     def _prepare_dynamixel(self):
         """
@@ -279,8 +414,18 @@ class Factr(Node, ABC):
             self.get_logger().info(
                 f"FACTR TELEOP {self.name}: Please match starting joint pos. Current joint pos: {curr_pos}"
             )
+
+            self.get_logger().info(
+                f"Errors {current_joint_error:.2f}: {curr_pos - self.initial_match_joint_pos[0 : self.num_arm_joints]}"
+            )
             curr_pos, _, _, _ = self.get_leader_joint_states()
             time.sleep(0.5)
+
+            if np.all(
+                curr_pos - self.initial_match_joint_pos[0 : self.num_arm_joints] < 0.1
+            ):
+                break  # Each joint is close enough to expected start position!
+
         self.get_logger().info(
             f"FACTR TELEOP {self.name}: Initial joint position matched."
         )
@@ -296,16 +441,26 @@ class Factr(Node, ABC):
         """
         Returns the current joint positions and velocities of the leader arm and gripper,
         aligned with the joint conventions (range and direction) of the follower arm.
+        All positions are wrapped to [-π, π].
         """
         self.gripper_pos_prev = self.gripper_pos
         joint_pos, joint_vel = self.driver.get_positions_and_velocities()
+
+        # Apply joint signs to get positions in the correct direction
+        # Note: Homing offsets are now stored in EEPROM, so no software offset needed
         joint_pos_arm = (
             joint_pos[0 : self.num_arm_joints]
-            - self.joint_offsets[0 : self.num_arm_joints]
-        ) * self.joint_signs[0 : self.num_arm_joints]
-        self.gripper_pos = (joint_pos[-1] - self.joint_offsets[-1]) * self.joint_signs[
-            -1
-        ]
+            * self.joint_signs[0 : self.num_arm_joints]
+        )
+
+        # Wrap all joint positions to [-π, π]
+        for i in range(len(joint_pos_arm)):
+            joint_pos_arm[i] = np.arctan2(
+                np.sin(joint_pos_arm[i]), np.cos(joint_pos_arm[i])
+            )
+
+        self.gripper_pos = joint_pos[-1] * self.joint_signs[-1]
+
         joint_vel_arm = (
             joint_vel[0 : self.num_arm_joints]
             * self.joint_signs[0 : self.num_arm_joints]
@@ -490,11 +645,11 @@ class Factr(Node, ABC):
         torque_l, torque_gripper = self.joint_limit_barrier(
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
         )
-        print(f"JL Barrier {torque_l}")
+        # print(f"JL Barrier {torque_l}")
         torque_arm += torque_l
 
         torque_null_space = self.null_space_regulation(leader_arm_pos, leader_arm_vel)
-        print(f"NS Reg {torque_null_space}")
+        # print(f"NS Reg {torque_null_space}")
         torque_arm += torque_null_space
 
         if self.enable_gravity_comp:
