@@ -1,6 +1,6 @@
 # FACTR Interface
 
-A bridge between FACTR and ROS2. Includes force feedback and gravity compensation.
+A bridge between FACTR and ROS2. Includes force feedback and gravity compensation. The main function is `Factr.act(forces)`, which returns the current positions of the FACTR. 
 
 ## Program flow
 

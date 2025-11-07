@@ -1,0 +1,65 @@
+name: grav_comp_demo
+
+dynamixel:
+  # USB port name given by the command: ls /dev/serial/by-id/
+  dynamixel_port: "usb-FTDI_USB__-__Serial_Converter_FTAA0AKR-if00-port0"
+  # Servo types
+  servo_types:
+    [
+      "XC330_T288_T",
+      "XM430_W210_T",
+      "XC330_T288_T",
+      "XM430_W210_T",
+      "XC330_T288_T",
+      "XC330_T288_T",
+      "XC330_T288_T",
+      "XC330_T288_T",
+    ]
+  # Servo joint directions to match that of the leader arm
+  joint_signs: [1, 1, 1, -1, 1, -1, 1, -1]
+
+arm_teleop:
+  # URDF used for creating leader arm dynamics model to compute gravity compensation
+  leader_urdf: "factr_teleop_franka.urdf"
+  num_arm_joints: 7
+  arm_joint_limits_max: [2.8973, 3.502, 3.073, 0.0, 3.06, 5.025, 3.141]
+  arm_joint_limits_min: [-2.8973, -0.366, -3.073, -3.211, -3.06, 1.591, -3.141]
+  arm_joint_limits_safety_margin: 0.1
+  initialization:
+    # The expected leader arm joint position before launching the script
+    calibration_joint_pos:
+      [-0.0031, 7.4613, -1.5002, -7.515, -1.514, -3.7138, 3.2612]
+    # The leader arm must be brought to this joint position before the follower starts mirroring the leader
+    initial_match_joint_pos:
+      [0.008, 10.324, -1.529, -8.728, -1.476, -4.743, 1.752]
+gripper_teleop:
+  # The maximum range (in rad) of the leader gripper trigger
+  actuation_range: 0.8
+
+controller:
+  frequency: 500
+  torque_feedback:
+    enable: False
+    gain: 0.0
+    damping: 0.0
+    motor_scalar: 94.5652173913
+  gravity_comp:
+    enable: True
+    gain: 0.3
+  null_space_regulation:
+    null_space_joint_target: [0.0, -0.7854, 0.0, -2.356, 0.0, 1.57, 0.0, 0.0]
+    kp: 0.0
+    kd: 0.00
+  static_friction_comp:
+    enable_speed: 0.9
+    gain: 0.0
+  joint_limit_barrier:
+    kp: 0.0
+    kd: 0.0
+  joint_position_control:
+    interpolation_step_size: 0.5
+    kp: 1.03561658022
+    kd: 0.04315069084
+
+  gripper_feedback:
+    enable: False

@@ -1,9 +1,4 @@
-import pinocchio as pin
-import numpy as np
-import os
-
-# Create a temporary URDF file
-urdf_content = """<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <robot
   name="factr_teleop_franka">
   <link
@@ -453,40 +448,3 @@ urdf_content = """<?xml version="1.0" encoding="utf-8"?>
       velocity="6.8" />
   </joint>
 </robot>
-"""
-
-urdf_path = "simple_arm.urdf"
-with open(urdf_path, "w") as f:
-    print("Writing content")
-    f.write(urdf_content)
-
-urdf_path = (
-    "/home/wheitman/wheitman_ws/src/factr_interface/urdf/factr_teleop_franka.urdf"
-)
-
-# 1. Load the robot model from the URDF file
-model, collision_model, visual_model = pin.buildModelsFromUrdf(
-    filename=urdf_path,
-    package_dirs="/home/wheitman/wheitman_ws/src/factr_interface/urdf",
-)
-
-# 2. Create the data structure for the robot model
-data = model.createData()
-
-# 3. Define the robot's state: joint positions, velocities, and accelerations
-# For gravity compensation, velocities and accelerations are zero.
-q = np.zeros(model.nv)  # Joint configuration (e.g., 45 and 90 degrees)
-q[1] = np.pi / 2
-v = np.zeros(model.nv)  # Zero joint velocities
-a = np.zeros(model.nv)  # Zero joint accelerations
-
-# 4. Calculate the required inverse dynamics torques using RNEA
-# The pin.rnea function computes the full inverse dynamics equation:
-# tau = M(q) * a + C(q, v) * v + G(q)
-# Since 'v' and 'a' are zero, the result is simply the gravity vector G(q).
-torques = pin.rnea(model, data, q, v, a)
-
-# 5. Print the results
-print("Number of joints (nv):", model.nv)
-print("Joint configuration (q):", q)
-print("Gravity compensation torques (tau_g):", torques)
