@@ -16,7 +16,7 @@ dynamixel:
       "XC330_T288_T",
     ]
   # Servo joint directions to match that of the leader arm
-  joint_signs: [1, -1, 1, -1, 1, 1, 1, -1]
+  joint_signs: [1, 1, 1, -1, 1, -1, 1, -1]
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
@@ -41,31 +41,44 @@ gripper_teleop:
 
 controller:
   frequency: 500
+  exponential_smoothing:
+    # Enable exponential smoothing of control torques
+    # Smoothing formula: smoothed = alpha * current + (1 - alpha) * previous
+    # alpha = 1.0 means no smoothing (use current value directly)
+    # alpha = 0.0 means full smoothing (use only previous value)
+    # Typical values: 0.1 - 0.5 for moderate smoothing
+    enable: True
+    alpha: 0.3
   torque_feedback:
     enable: False
     gain: 3.0
     damping: 0.0
     motor_scalar: 94.5652173913
   gravity_comp:
-    enable: False
-    gain: 0.85
+    enable: Enable
+    gain: 0.6
   null_space_regulation:
     null_space_joint_target: [0.0, -0.7854, 0.0, -2.356, 0.0, 1.57, 0.0, 0.0]
-    kp: 0.1
-    kd: 0.01
+    kp: 0.0
+    # kp: 0.1
+    kd: 0.0
+    # kd: 0.01
   static_friction_comp:
     enable_speed: 0.9
-    gain: 0.6
+    gain: 1.0
   joint_limit_barrier:
     kp: 0.0
     # kp: 1.03561658022
-    kd: 0.04315069084
+    kd: 0.0
+    # kd: 0.04315069084
   joint_position_control:
     interpolation_step_size: 0.5
     kp: 1.03561658022
     kd: 0.04315069084
 
   gripper_feedback:
-    enable: False
+    enable: True
     gain: 0.28328611898
     ema_beta: 0.95
+    spring_constant: 0.1
+    spring_displacement_offset: 0.8

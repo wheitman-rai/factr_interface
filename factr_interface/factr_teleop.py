@@ -135,6 +135,24 @@ class Factr(Node, ABC):
             "enable"
         ]
 
+        self.gripper_spring_constant = self.config["controller"]["gripper_feedback"][
+            "spring_constant"
+        ]
+
+        self.gripper_spring_displacement_offset = self.config["controller"][
+            "gripper_feedback"
+        ]["spring_displacement_offset"]
+
+        # exponential smoothing
+        self.enable_exponential_smoothing = self.config["controller"][
+            "exponential_smoothing"
+        ]["enable"]
+        self.smoothing_alpha = self.config["controller"]["exponential_smoothing"][
+            "alpha"
+        ]
+        self.smoothed_torque_arm = np.zeros(self.num_arm_joints)
+        self.smoothed_torque_gripper = 0.0
+
         # needs to be implemented to establish communication between the leader and the follower
         self.set_up_communication()
 
@@ -637,6 +655,7 @@ class Factr(Node, ABC):
         support a 500 Hz control frequency, ensure that the Baud Rate is set to 4 Mbps
         and the Return Delay Time is set to 0 using the Dynamixel Wizard software.
         """
+
         leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = (
             self.get_leader_joint_states()
         )
@@ -645,7 +664,7 @@ class Factr(Node, ABC):
         torque_l, torque_gripper = self.joint_limit_barrier(
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
         )
-        # print(f"JL Barrier {torque_l}")
+        print(f"JL Barrier {torque_gripper}")
         torque_arm += torque_l
 
         torque_null_space = self.null_space_regulation(leader_arm_pos, leader_arm_vel)
@@ -677,8 +696,30 @@ class Factr(Node, ABC):
             torque_gripper += self.gripper_feedback(
                 leader_gripper_pos, leader_gripper_vel, gripper_feedback
             )
+            print(f"After gripper fb: {torque_gripper}")
 
-        self.set_leader_joint_torque(torque_arm, torque_gripper)
+        # Apply exponential smoothing if enabled
+        if self.enable_exponential_smoothing:
+            self.smoothed_torque_arm = (
+                self.smoothing_alpha * torque_arm
+                + (1 - self.smoothing_alpha) * self.smoothed_torque_arm
+            )
+            self.smoothed_torque_gripper = (
+                self.smoothing_alpha * torque_gripper
+                + (1 - self.smoothing_alpha) * self.smoothed_torque_gripper
+            )
+
+            self.latest_torques = np.concatenate(
+                [self.smoothed_torque_arm.copy(), [self.smoothed_torque_gripper]]
+            )
+
+            self.set_leader_joint_torque(
+                self.smoothed_torque_arm, self.smoothed_torque_gripper
+            )
+        else:
+            self.latest_torques = np.concatenate([torque_arm.copy(), [torque_gripper]])
+            self.set_leader_joint_torque(torque_arm, torque_gripper)
+
         self.update_communication(leader_arm_pos, leader_gripper_pos)
 
     @abstractmethod
@@ -771,4 +812,5 @@ class Factr(Node, ABC):
         Raises:
             NotImplementedError: If the method is not implemented in a subclass.
         """
+
         pass
