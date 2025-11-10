@@ -79,6 +79,9 @@ class Factr(Node, ABC):
         self.initial_match_joint_pos = np.array(
             self.config["arm_teleop"]["initialization"]["initial_match_joint_pos"]
         )
+
+        self.global_torque_limit = self.config["controller"]["global_torque_limit"]
+
         assert (
             self.num_arm_joints
             == len(self.arm_joint_limits_max)
@@ -565,6 +568,10 @@ class Factr(Node, ABC):
             )
         else:
             tau_l_gripper = 0.0
+
+        # NOTE: I removed joint limit feedback for the gripper here. WSH.
+        tau_l_gripper = 0.0
+
         return tau_l, tau_l_gripper
 
     def gravity_compensation(self, arm_joint_pos, arm_joint_vel):
@@ -698,6 +705,13 @@ class Factr(Node, ABC):
             )
             print(f"After gripper fb: {torque_gripper}")
 
+        if np.any(np.abs(torque_arm) > self.global_torque_limit):
+            self.get_logger().warning("Global torque limit exceeded!")
+
+        torque_arm = np.clip(
+            torque_arm, -self.global_torque_limit, self.global_torque_limit
+        )
+
         # Apply exponential smoothing if enabled
         if self.enable_exponential_smoothing:
             self.smoothed_torque_arm = (
@@ -740,7 +754,7 @@ class Factr(Node, ABC):
         pass
 
     @abstractmethod
-    def get_leader_arm_external_joint_torque(self):
+    def get_leader_arm_external_joint_torque(self) -> None:
         """
         This method should retrieve the current external joint torque from the follower arm.
         This is used to compute force-feedback in the leader arm. This method is called at

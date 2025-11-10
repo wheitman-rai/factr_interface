@@ -16,16 +16,16 @@ dynamixel:
       "XC330_T288_T",
     ]
   # Servo joint directions to match that of the leader arm
-  joint_signs: [1, 1, 1, -1, 1, -1, 1, -1]
+  joint_signs: [1, 1, 1, -1, 1, 1, 1, -1]
 
 arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
   leader_urdf: "factr_teleop_franka.urdf"
   num_arm_joints: 7
   arm_joint_limits_max:
-    [2.8973, 1.7628, 2.8973, -0.8698, 2.8973, 3.7525, 2.8973]
+    [1.8973, 1.7628, 2.8973, -0.8698, 2.8973, 3.7525, 2.8973]
   arm_joint_limits_min:
-    [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
+    [-1.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # The expected leader arm joint position before launching the script
@@ -41,6 +41,7 @@ gripper_teleop:
 
 controller:
   frequency: 500
+  global_torque_limit: 0.4
   exponential_smoothing:
     # Enable exponential smoothing of control torques
     # Smoothing formula: smoothed = alpha * current + (1 - alpha) * previous
@@ -67,10 +68,10 @@ controller:
     enable_speed: 0.9
     gain: 1.0
   joint_limit_barrier:
-    kp: 0.0
-    # kp: 1.03561658022
-    kd: 0.0
-    # kd: 0.04315069084
+    # kp: 0.0
+    kp: 1.03561658022
+    # kd: 0.0
+    kd: 0.04315069084
   joint_position_control:
     interpolation_step_size: 0.5
     kp: 1.03561658022
@@ -80,5 +81,13 @@ controller:
     enable: True
     gain: 0.28328611898
     ema_beta: 0.95
-    spring_constant: 0.1
-    spring_displacement_offset: 0.8
+    spring_constant: 0.06
+    spring_displacement_offset: 1.0
+
+mujoco:
+  # MuJoCo simulation settings for follower Franka FR3 arm
+  sim_timestep: 0.002 # 500 Hz to match controller frequency
+  # Torque control gains for position tracking
+  position_control:
+    kp: [1000.0, 1000.0, 1000.0, 1000.0, 300.0, 300.0, 300.0] # Joint stiffness
+    kd: [50.0, 50.0, 50.0, 50.0, 15.0, 15.0, 15.0] # Joint damping

@@ -5,8 +5,10 @@ import rclpy
 from factr_interface.factr_teleop import Factr
 from gui import Gui
 
+from sensor_msgs.msg import JointState
 
-class FACTRTeleopGravComp(Factr):
+
+class FACTRTeleopMujoco(Factr):
     """
     This class demonstrates the gravity compensation and null-space regulation function of the
     FACTR teleop leader arm. Communication between the leader arm and the follower Franka arm
@@ -17,13 +19,32 @@ class FACTRTeleopGravComp(Factr):
         super().__init__()
         self.gui = Gui()
         # Store the latest torques for visualization
-        self.latest_torques = np.zeros(self.num_arm_joints)
+        self.latest_leader_torques = np.zeros(self.num_arm_joints)
+        self.latest_follower_torques = np.zeros(self.num_arm_joints)
 
     def set_up_communication(self):
-        pass
+        self.follower_state_sub = self.create_subscription(
+            JointState, "/joint_states", self.follower_state_cb, 1
+        )
+        self.follower_command_pub = self.create_publisher(
+            JointState, "/hybrid_joint_impedance_controller/commands", 1
+        )
 
     def get_leader_gripper_feedback(self):
         pass
+
+    def follower_state_cb(self, msg: JointState):
+        self.latest_follower_state = msg
+
+        expected_names = [f"fr3_joint{n}" for n in range(1, 8)]
+
+        efforts = []
+        for expected_name in expected_names:
+            for idx, actual_name in enumerate(msg.name):
+                if expected_name == actual_name:
+                    efforts.append(msg.effort[idx])
+
+        self.latest_follower_torques = np.asarray(efforts)
 
     def gripper_feedback(
         self, leader_gripper_pos, leader_gripper_vel, gripper_feedback
@@ -34,23 +55,31 @@ class FACTRTeleopGravComp(Factr):
         return -self.gripper_spring_constant * displacement
 
     def get_leader_arm_external_joint_torque(self):
-        pass
+        return self.latest_follower_torques
 
-    def update_communication(self, leader_arm_pos, leader_gripper_pos):
+    def update_communication(self, leader_arm_pos: np.ndarray, leader_gripper_pos):
         """
         Transmit data from the leader (FACTR) to the follower (Franka).
         Also update the Viser UI
         """
 
         # Update the GUI with torque data
-        self.gui.update(leader_arm_pos, leader_gripper_pos, self.latest_torques)
+        self.gui.update(leader_arm_pos, leader_gripper_pos, self.latest_leader_torques)
 
-        pass
+        command_msg = JointState()
+        command_msg.name = [f"fr3_joint{n}" for n in range(1, 8)]
+
+        print(leader_arm_pos)
+        command_msg.position = leader_arm_pos.tolist()
+
+        # TODO WSH: Add gripper support
+
+        self.follower_command_pub.publish(command_msg)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    factr_teleop_grav_comp = FACTRTeleopGravComp()
+    factr_teleop_grav_comp = FACTRTeleopMujoco()
 
     try:
         while rclpy.ok():
