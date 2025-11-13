@@ -19,7 +19,6 @@ class FACTRTeleopMujoco(Factr):
         super().__init__()
         self.gui = Gui()
         # Store the latest torques for visualization
-        self.latest_leader_torques = np.zeros(self.num_arm_joints)
         self.latest_follower_torques = np.zeros(self.num_arm_joints)
 
     def set_up_communication(self):
@@ -39,18 +38,21 @@ class FACTRTeleopMujoco(Factr):
         expected_names = [f"fr3_joint{n}" for n in range(1, 8)]
 
         efforts = []
+        positions = []
         for expected_name in expected_names:
             for idx, actual_name in enumerate(msg.name):
                 if expected_name == actual_name:
                     efforts.append(msg.effort[idx])
+                    positions.append(msg.position[idx])
 
         self.latest_follower_torques = np.asarray(efforts)
+        self.latest_follower_positions = np.asarray(positions)
 
     def gripper_feedback(
         self, leader_gripper_pos, leader_gripper_vel, gripper_feedback
     ):
         displacement = leader_gripper_pos + self.gripper_spring_displacement_offset
-        print(displacement)
+        # print(displacement)
 
         return -self.gripper_spring_constant * displacement
 
@@ -64,12 +66,23 @@ class FACTRTeleopMujoco(Factr):
         """
 
         # Update the GUI with torque data
+        # print(f"Latest toruqes: {self.latest_leader_torques}")
         self.gui.update(leader_arm_pos, leader_gripper_pos, self.latest_leader_torques)
 
         command_msg = JointState()
         command_msg.name = [f"fr3_joint{n}" for n in range(1, 8)]
 
-        print(leader_arm_pos)
+        # print(leader_arm_pos)
+
+        # joint_error = np.abs(leader_arm_pos - self.latest_follower_positions)
+
+        # if np.any(joint_error > 0.1):
+        #     self.get_logger().warning(
+        #         "Skipping command pub because joint error was too large"
+        #     )
+        #     self.get_logger().warning(f"{joint_error}")
+        #     return
+
         command_msg.position = leader_arm_pos.tolist()
 
         # TODO WSH: Add gripper support

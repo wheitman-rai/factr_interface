@@ -6,6 +6,7 @@ import numpy as np
 import pinocchio as pin
 from abc import ABC, abstractmethod
 
+import rclpy
 from rclpy.node import Node
 from factr_interface.dynamixel.driver import DynamixelDriver
 from dynamixel_sdk.robotis_def import COMM_SUCCESS
@@ -58,6 +59,9 @@ class Factr(Node, ABC):
 
         self.name = self.config["name"]
         self.dt = 1 / self.config["controller"]["frequency"]
+
+        self.latest_follower_positions = None
+        self.latest_leader_torques = np.zeros(7)
 
         self._prepare_dynamixel()
         self._prepare_inverse_dynamics()
@@ -160,7 +164,6 @@ class Factr(Node, ABC):
         self.set_up_communication()
 
         # calibrate the leader arm joints before starting
-        # self._get_dynamixel_offsets()
         self._set_homing_offsets_in_docked_position()
         # ensure the leader and the follower arms have the same joint positions before starting
         self._match_start_pos()
@@ -366,70 +369,46 @@ class Factr(Node, ABC):
         )
         self.pin_data = self.pin_model.createData()
 
-    def _get_dynamixel_offsets(self, verbose=True):
-        """
-        Calibrates the Dynamixel servos with respect to the Franka arm to ensure the joint
-        position readings of the leader arm correspond to those of the follower arm.
-
-        Before launching this program, the leader arm should be manually placed in a
-        configuration roughly corresponding to the follower's calibration position
-        described in self.calibration_joint_pos (within ±90 degrees per joint).
-        """
-        # warm up
-        for _ in range(10):
-            self.driver.get_positions_and_velocities()
-
-        def _get_error(calibration_joint_pos, offset, index, joint_state):
-            joint_sign_i = self.joint_signs[index]
-            joint_i = joint_sign_i * (joint_state[index] - offset)
-            start_i = calibration_joint_pos[index]
-            return np.abs(joint_i - start_i)
-
-        # get arm offsets
-        self.joint_offsets = []
-        curr_joints, _ = self.driver.get_positions_and_velocities()
-        for i in range(self.num_arm_joints):
-            best_offset = 0
-            best_error = 1e9
-            # intervals of pi/2
-            for offset in np.linspace(-20 * np.pi, 20 * np.pi, 20 * 4 + 1):
-                error = _get_error(self.calibration_joint_pos, offset, i, curr_joints)
-                if error < best_error:
-                    best_error = error
-                    best_offset = offset
-            self.joint_offsets.append(best_offset)
-
-        # get gripper offset:
-        curr_gripper_joint = curr_joints[-1]
-        self.joint_offsets.append(curr_gripper_joint)
-
-        self.joint_offsets = np.asarray(self.joint_offsets)
-        if verbose:
-            print(self.joint_offsets)
-            print(
-                "best offsets               : ",
-                [f"{x:.3f}" for x in self.joint_offsets],
-            )
-            print(
-                "best offsets function of pi: ["
-                + ", ".join(
-                    [
-                        f"{int(np.round(x/(np.pi/2)))}*np.pi/2"
-                        for x in self.joint_offsets
-                    ]
-                )
-                + " ]",
-            )
-
     def _match_start_pos(self):
         """
         Waits until the leader arm is manually moved to roughly the same configuration as the
         follower arm before the follower arm starts mirroring the leader arm.
         """
-        curr_pos, _, _, _ = self.get_leader_joint_states()
-        while True:
+        # First, wait for the follower position to be available
+        self.get_logger().info("Waiting for follower joint positions...")
+        while self.latest_follower_positions is None and rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        if not rclpy.ok():
+            return  # Node is shutting down
+
+        self.get_logger().info(
+            "Follower positions received. Starting position matching..."
+        )
+
+        interpolation_step_size = (
+            np.ones(7)
+            * self.config["controller"]["joint_position_control"][
+                "interpolation_step_size"
+            ]
+        )
+        kp = self.config["controller"]["joint_position_control"]["kp"]
+        kd = self.config["controller"]["joint_position_control"]["kd"]
+
+        while rclpy.ok():
+            curr_pos, curr_vel, curr_gripper_pos, curr_gripper_vel = (
+                self.get_leader_joint_states()
+            )
+            next_joint_pos_target = np.where(
+                np.abs(curr_pos - self.latest_follower_positions)
+                > interpolation_step_size,
+                curr_pos
+                + interpolation_step_size
+                * np.sign(self.latest_follower_positions - curr_pos),
+                self.latest_follower_positions,
+            )
             current_joint_error = np.linalg.norm(
-                curr_pos - self.initial_match_joint_pos[0 : self.num_arm_joints]
+                curr_pos - self.latest_follower_positions
             )
             np.set_printoptions(suppress=True, precision=4)
             self.get_logger().info(
@@ -437,15 +416,26 @@ class Factr(Node, ABC):
             )
 
             self.get_logger().info(
-                f"Errors {current_joint_error:.2f}: {curr_pos - self.initial_match_joint_pos[0 : self.num_arm_joints]}"
+                f"Errors {current_joint_error:.2f}: {curr_pos - self.latest_follower_positions}"
             )
-            curr_pos, _, _, _ = self.get_leader_joint_states()
-            time.sleep(0.5)
 
-            if np.all(
-                curr_pos - self.initial_match_joint_pos[0 : self.num_arm_joints] < 0.1
-            ):
+            # Check if position is matched
+            if np.all(np.abs(curr_pos - self.latest_follower_positions) < 0.2):
                 break  # Each joint is close enough to expected start position!
+
+            curr_pos, _, _, _ = self.get_leader_joint_states()
+
+            goal_gripper_pos = 0.0  # TODO WSH: Read from follower
+
+            torque = -kp * (curr_pos - next_joint_pos_target) - kd * (curr_vel)
+
+            # gripper_torque = -kp * (curr_gripper_pos - goal_gripper_pos) - kd * (
+            #     curr_gripper_vel
+            # )
+
+            gripper_torque = 0.0
+            self.set_leader_joint_torque(torque, gripper_torque)
+            time.sleep(0.1)
 
         self.get_logger().info(
             f"FACTR TELEOP {self.name}: Initial joint position matched."
@@ -671,7 +661,7 @@ class Factr(Node, ABC):
         torque_l, torque_gripper = self.joint_limit_barrier(
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
         )
-        print(f"JL Barrier {torque_gripper}")
+        # print(f"JL Barrier {torque_gripper}")
         torque_arm += torque_l
 
         torque_null_space = self.null_space_regulation(leader_arm_pos, leader_arm_vel)
@@ -684,8 +674,8 @@ class Factr(Node, ABC):
             )
             torque_friction_comp = self.friction_compensation(leader_arm_vel)
 
-            print(f"Grav Comp {torque_gravity_comp}")
-            print(f"Friction Comp {torque_friction_comp}")
+            # print(f"Grav Comp {torque_gravity_comp}")
+            # print(f"Friction Comp {torque_friction_comp}")
 
             torque_arm += torque_gravity_comp
             torque_arm += torque_friction_comp
@@ -695,7 +685,13 @@ class Factr(Node, ABC):
             torque_feedback = self.torque_feedback(
                 external_joint_torque, leader_arm_vel
             )
+
+            # Only consider the second joint
+            torque_feedback[4:] = 0.0
+
             print(f"Torque FB {torque_feedback}")
+
+            self.latest_leader_torques = torque_feedback
             torque_arm += torque_feedback
 
         if self.enable_gripper_feedback:
@@ -703,7 +699,6 @@ class Factr(Node, ABC):
             torque_gripper += self.gripper_feedback(
                 leader_gripper_pos, leader_gripper_vel, gripper_feedback
             )
-            print(f"After gripper fb: {torque_gripper}")
 
         if np.any(np.abs(torque_arm) > self.global_torque_limit):
             self.get_logger().warning("Global torque limit exceeded!")
@@ -723,15 +718,17 @@ class Factr(Node, ABC):
                 + (1 - self.smoothing_alpha) * self.smoothed_torque_gripper
             )
 
-            self.latest_torques = np.concatenate(
-                [self.smoothed_torque_arm.copy(), [self.smoothed_torque_gripper]]
-            )
+            # self.latest_leader_torques = np.concatenate(
+            #     [self.smoothed_torque_arm.copy(), [self.smoothed_torque_gripper]]
+            # )
 
             self.set_leader_joint_torque(
                 self.smoothed_torque_arm, self.smoothed_torque_gripper
             )
         else:
-            self.latest_torques = np.concatenate([torque_arm.copy(), [torque_gripper]])
+            self.latest_leader_torques = np.concatenate(
+                [torque_arm.copy(), [torque_gripper]]
+            )
             self.set_leader_joint_torque(torque_arm, torque_gripper)
 
         self.update_communication(leader_arm_pos, leader_gripper_pos)
@@ -754,7 +751,7 @@ class Factr(Node, ABC):
         pass
 
     @abstractmethod
-    def get_leader_arm_external_joint_torque(self) -> None:
+    def get_leader_arm_external_joint_torque(self) -> np.ndarray:
         """
         This method should retrieve the current external joint torque from the follower arm.
         This is used to compute force-feedback in the leader arm. This method is called at

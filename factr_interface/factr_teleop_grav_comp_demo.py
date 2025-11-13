@@ -36,7 +36,6 @@ class FACTRTeleopGravComp(Factr):
         super().__init__()
         self.gui = Gui()
         # Store the latest torques for visualization
-        self.latest_torques = np.zeros(self.num_arm_joints)
 
     def set_up_communication(self):
         pass
