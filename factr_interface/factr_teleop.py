@@ -429,6 +429,9 @@ class Factr(Node, ABC):
 
             torque = -kp * (curr_pos - next_joint_pos_target) - kd * (curr_vel)
 
+            # Only consider the first two joints
+            torque[4:] = 0.0
+
             # gripper_torque = -kp * (curr_gripper_pos - goal_gripper_pos) - kd * (
             #     curr_gripper_vel
             # )

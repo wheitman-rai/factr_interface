@@ -41,7 +41,7 @@ gripper_teleop:
 
 controller:
   frequency: 500
-  global_torque_limit: 0.6
+  global_torque_limit: 0.8
   exponential_smoothing:
     # Enable exponential smoothing of control torques
     # Smoothing formula: smoothed = alpha * current + (1 - alpha) * previous
@@ -49,15 +49,15 @@ controller:
     # alpha = 0.0 means full smoothing (use only previous value)
     # Typical values: 0.1 - 0.5 for moderate smoothing
     enable: True
-    alpha: 0.2
+    alpha: 0.1
   torque_feedback:
-    enable: False
-    gain: 3.0
-    damping: 0.0
+    enable: True
+    gain: 4.8
+    damping: 0.2
     motor_scalar: 94.5652173913
   gravity_comp:
-    enable: False
-    gain: 0.6
+    enable: True
+    gain: 0.3
   null_space_regulation:
     null_space_joint_target: [0.0, -0.7854, 0.0, -2.356, 0.0, 1.57, 0.0, 0.0]
     # kp: 0.0
@@ -74,8 +74,7 @@ controller:
     # kd: 0.04315069084
   joint_position_control:
     interpolation_step_size: 0.5
-    kp: 0.0
-    # kp: 0.1
+    kp: 0.2
     # kp: 1.03561658022
     kd: 0.04
     # kd: 0.04315069084
