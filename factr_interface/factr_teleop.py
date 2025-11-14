@@ -1,36 +1,26 @@
+"""
+FACTR Teleoperation Base Class
+
+This module provides the base class for implementing the FACTR low-cost force-feedback
+teleoperation system for a follower robotic arm.
+"""
+
 import os
-import time
-import yaml
 import subprocess
-import numpy as np
-import pinocchio as pin
+import time
 from abc import ABC, abstractmethod
 
+import numpy as np
+import pinocchio as pin
 import rclpy
-from rclpy.node import Node
-from factr_interface.dynamixel.driver import DynamixelDriver
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from dynamixel_sdk.robotis_def import COMM_SUCCESS
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
 
-
-def find_ttyusb(port_name):
-    """
-    This function is used to locate the underlying ttyUSB device.
-    """
-    base_path = "/dev/serial/by-id/"
-    full_path = os.path.join(base_path, port_name)
-    if not os.path.exists(full_path):
-        raise Exception(f"Port '{port_name}' does not exist in {base_path}.")
-    try:
-        resolved_path = os.readlink(full_path)
-        actual_device = os.path.basename(resolved_path)
-        if actual_device.startswith("ttyUSB"):
-            return actual_device
-        else:
-            raise Exception(
-                f"The port '{port_name}' does not correspond to a ttyUSB device. It links to {resolved_path}."
-            )
-    except Exception as e:
-        raise Exception(f"Unable to resolve the symbolic link for '{port_name}'. {e}")
+from factr_interface.dynamixel.driver import DynamixelDriver
+from factr_interface.utils import find_ttyusb
 
 
 class Factr(Node, ABC):
@@ -50,125 +40,178 @@ class Factr(Node, ABC):
     def __init__(self):
         super().__init__("factr_teleop")
 
-        # TODO WSH: PARAMETERIZE THIS PATH
-        with open(
-            "/home/wheitman/wheitman_ws/src/factr_interface/factr_interface/configs/config.yaml",
-            "r",
-        ) as config_file:
-            self.config = yaml.safe_load(config_file)
+        # Load configuration
+        self._load_config()
 
-        self.name = self.config["name"]
-        self.dt = 1 / self.config["controller"]["frequency"]
-
-        self.latest_follower_positions = None
-        self.latest_leader_torques = np.zeros(7)
-
+        # Initialize hardware interfaces
         self._prepare_dynamixel()
         self._prepare_inverse_dynamics()
 
-        # leader arm parameters
-        self.num_arm_joints = self.config["arm_teleop"]["num_arm_joints"]
-        self.safety_margin = self.config["arm_teleop"]["arm_joint_limits_safety_margin"]
-        self.arm_joint_limits_max = (
-            np.array(self.config["arm_teleop"]["arm_joint_limits_max"])
-            - self.safety_margin
-        )
-        self.arm_joint_limits_min = (
-            np.array(self.config["arm_teleop"]["arm_joint_limits_min"])
-            + self.safety_margin
-        )
-        self.calibration_joint_pos = np.array(
-            self.config["arm_teleop"]["initialization"]["calibration_joint_pos"]
-        )
-        self.initial_match_joint_pos = np.array(
-            self.config["arm_teleop"]["initialization"]["initial_match_joint_pos"]
-        )
+        # Initialize state variables
+        self.latest_follower_positions = None
+        self.latest_leader_torques = np.zeros(7)
 
+        # Set up joint state publisher for RViz visualization
+        self._setup_joint_state_publisher()
+
+        # Set up communication (implemented by subclasses)
+        self.set_up_communication()
+
+        # Calibration and initialization sequence
+        self._set_homing_offsets_in_docked_position()
+        self._match_start_pos()
+
+        # Start the control loop
+        self.timer = self.create_timer(self.dt, self.control_loop_callback)
+
+    def _load_config(self):
+        """Load and parse configuration from YAML file."""
+        package_share_dir = get_package_share_directory("factr_interface")
+        config_path = os.path.join(package_share_dir, "config", "config.yaml")
+
+        with open(config_path, "r") as config_file:
+            self.config = yaml.safe_load(config_file)
+
+        # Basic parameters
+        self.name = self.config["name"]
+        self.dt = 1 / self.config["controller"]["frequency"]
         self.global_torque_limit = self.config["controller"]["global_torque_limit"]
 
+        # Arm parameters
+        self._load_arm_config()
+
+        # Gripper parameters
+        self._load_gripper_config()
+
+        # Controller parameters
+        self._load_controller_config()
+
+    def _load_arm_config(self):
+        """Load arm-specific configuration parameters."""
+        arm_config = self.config["arm_teleop"]
+
+        self.num_arm_joints = arm_config["num_arm_joints"]
+        self.safety_margin = arm_config["arm_joint_limits_safety_margin"]
+
+        self.arm_joint_limits_max = (
+            np.array(arm_config["arm_joint_limits_max"]) - self.safety_margin
+        )
+        self.arm_joint_limits_min = (
+            np.array(arm_config["arm_joint_limits_min"]) + self.safety_margin
+        )
+
+        self.calibration_joint_pos = np.array(
+            arm_config["initialization"]["calibration_joint_pos"]
+        )
+        self.initial_match_joint_pos = np.array(
+            arm_config["initialization"]["initial_match_joint_pos"]
+        )
+
+        # Validation
         assert (
             self.num_arm_joints
             == len(self.arm_joint_limits_max)
             == len(self.arm_joint_limits_min)
-        ), "num_arm_joints and the length of arm joint limits must be the same"
+        ), "num_arm_joints and arm joint limits must have the same length"
+
         assert (
             self.num_arm_joints
             == len(self.calibration_joint_pos)
             == len(self.initial_match_joint_pos)
-        ), "num_arm_joints and the length of calibration_joint_pos and initial_match_joint_pos must be the same"
+        ), "num_arm_joints and initialization positions must have the same length"
 
-        # leader gripper parameters
+    def _load_gripper_config(self):
+        """Load gripper-specific configuration parameters."""
+        gripper_config = self.config["gripper_teleop"]
+
         self.gripper_limit_min = 0.0
-        self.gripper_limit_max = self.config["gripper_teleop"]["actuation_range"]
+        self.gripper_limit_max = gripper_config["actuation_range"]
         self.gripper_pos_prev = 0.0
         self.gripper_pos = 0.0
 
-        # gravity comp
-        self.enable_gravity_comp = self.config["controller"]["gravity_comp"]["enable"]
-        self.gravity_comp_modifier = self.config["controller"]["gravity_comp"]["gain"]
-        self.tau_g = np.zeros(self.num_arm_joints)
-        # friction comp
-        self.stiction_comp_enable_speed = self.config["controller"][
-            "static_friction_comp"
-        ]["enable_speed"]
-        self.stiction_comp_gain = self.config["controller"]["static_friction_comp"][
-            "gain"
-        ]
-        self.stiction_dither_flag = np.ones((self.num_arm_joints), dtype=bool)
-        # joint limit barrier:
-        self.joint_limit_kp = self.config["controller"]["joint_limit_barrier"]["kp"]
-        self.joint_limit_kd = self.config["controller"]["joint_limit_barrier"]["kd"]
-        # null space regulation
-        self.null_space_joint_target = np.array(
-            self.config["controller"]["null_space_regulation"][
-                "null_space_joint_target"
-            ]
-        )
-        self.null_space_kp = self.config["controller"]["null_space_regulation"]["kp"]
-        self.null_space_kd = self.config["controller"]["null_space_regulation"]["kd"]
-        # torque feedback
-        self.enable_torque_feedback = self.config["controller"]["torque_feedback"][
-            "enable"
-        ]
-        self.torque_feedback_gain = self.config["controller"]["torque_feedback"]["gain"]
-        self.torque_feedback_motor_scalar = self.config["controller"][
-            "torque_feedback"
-        ]["motor_scalar"]
-        self.torque_feedback_damping = self.config["controller"]["torque_feedback"][
-            "damping"
-        ]
-        # gripper feedback
-        self.enable_gripper_feedback = self.config["controller"]["gripper_feedback"][
-            "enable"
-        ]
+    def _load_controller_config(self):
+        """Load controller-specific configuration parameters."""
+        controller_config = self.config["controller"]
 
-        self.gripper_spring_constant = self.config["controller"]["gripper_feedback"][
+        # Gravity compensation
+        self.enable_gravity_comp = controller_config["gravity_comp"]["enable"]
+        self.gravity_comp_modifier = controller_config["gravity_comp"]["gain"]
+        self.tau_g = np.zeros(self.num_arm_joints)
+
+        # Friction compensation
+        self.stiction_comp_enable_speed = controller_config["static_friction_comp"][
+            "enable_speed"
+        ]
+        self.stiction_comp_gain = controller_config["static_friction_comp"]["gain"]
+        self.stiction_dither_flag = np.ones(self.num_arm_joints, dtype=bool)
+
+        # Joint limit barrier
+        self.joint_limit_kp = controller_config["joint_limit_barrier"]["kp"]
+        self.joint_limit_kd = controller_config["joint_limit_barrier"]["kd"]
+
+        # Null space regulation
+        self.null_space_joint_target = np.array(
+            controller_config["null_space_regulation"]["null_space_joint_target"]
+        )
+        self.null_space_kp = controller_config["null_space_regulation"]["kp"]
+        self.null_space_kd = controller_config["null_space_regulation"]["kd"]
+
+        # Torque feedback
+        self.enable_torque_feedback = controller_config["torque_feedback"]["enable"]
+        self.torque_feedback_gain = controller_config["torque_feedback"]["gain"]
+        self.torque_feedback_motor_scalar = controller_config["torque_feedback"][
+            "motor_scalar"
+        ]
+        self.torque_feedback_damping = controller_config["torque_feedback"]["damping"]
+
+        # Gripper feedback
+        self.enable_gripper_feedback = controller_config["gripper_feedback"]["enable"]
+        self.gripper_spring_constant = controller_config["gripper_feedback"][
             "spring_constant"
         ]
-
-        self.gripper_spring_displacement_offset = self.config["controller"][
+        self.gripper_spring_displacement_offset = controller_config[
             "gripper_feedback"
         ]["spring_displacement_offset"]
 
-        # exponential smoothing
-        self.enable_exponential_smoothing = self.config["controller"][
-            "exponential_smoothing"
-        ]["enable"]
-        self.smoothing_alpha = self.config["controller"]["exponential_smoothing"][
-            "alpha"
+        # Exponential smoothing
+        self.enable_exponential_smoothing = controller_config["exponential_smoothing"][
+            "enable"
         ]
+        self.smoothing_alpha = controller_config["exponential_smoothing"]["alpha"]
         self.smoothed_torque_arm = np.zeros(self.num_arm_joints)
         self.smoothed_torque_gripper = 0.0
 
-        # needs to be implemented to establish communication between the leader and the follower
-        self.set_up_communication()
+    def _setup_joint_state_publisher(self):
+        """Set up publisher for joint states to visualize in RViz."""
+        self.joint_state_pub = self.create_publisher(
+            JointState, "leader_joint_states", 10
+        )
+        self.get_logger().info("Joint state publisher initialized for RViz visualization")
 
-        # calibrate the leader arm joints before starting
-        self._set_homing_offsets_in_docked_position()
-        # ensure the leader and the follower arms have the same joint positions before starting
-        self._match_start_pos()
-        # start the control loop
-        self.timer = self.create_timer(self.dt, self.control_loop_callback)
+    def _publish_joint_states(self, arm_positions, gripper_position=None):
+        """
+        Publish current joint states for RViz visualization.
+
+        Args:
+            arm_positions: NumPy array of arm joint positions
+            gripper_position: Scalar gripper position (currently not published)
+        """
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = ""
+
+        # Joint names matching the URDF (joint_1, joint_2, etc.)
+        msg.name = [f"joint_{i+1}" for i in range(self.num_arm_joints)]
+
+        # Positions
+        msg.position = arm_positions.tolist()
+
+        # Optional: add velocities if available
+        msg.velocity = []
+        msg.effort = []
+
+        # Publish
+        self.joint_state_pub.publish(msg)
 
     def _set_homing_offsets_in_docked_position(self):
         """
@@ -357,15 +400,21 @@ class Factr(Node, ABC):
         Creates a model of the leader arm given the its URDF for kinematic and dynamic
         computations used in gravity compensation and null-space regulation calculations.
         """
-        self.leader_urdf = os.path.join(
-            "src/factr_teleop/factr_teleop/urdf/",
+        package_share_dir = get_package_share_directory("factr_interface")
+        urdf_dir = os.path.join(package_share_dir, "urdf")
+
+        urdf_filename = os.path.join(
+            urdf_dir,
             self.config["arm_teleop"]["leader_urdf"],
         )
 
-        # TODO WSH: DEJANK THESE HARDCODED PATHS
+        self.get_logger().debug(
+            f"Loading URDF from {urdf_filename} with mesh path {package_share_dir}"
+        )
+
         self.pin_model, _, _ = pin.buildModelsFromUrdf(
-            filename="/home/wheitman/wheitman_ws/src/factr_interface/build/factr_interface/factr_interface/urdf/factr_teleop_franka.urdf",
-            package_dirs="/home/wheitman/wheitman_ws/src/factr_interface/build/factr_interface/factr_interface/urdf",
+            filename=urdf_filename,
+            package_dirs=package_share_dir + "/urdf",
         )
         self.pin_data = self.pin_model.createData()
 
@@ -432,10 +481,7 @@ class Factr(Node, ABC):
             # Only consider the first two joints
             torque[4:] = 0.0
 
-            # gripper_torque = -kp * (curr_gripper_pos - goal_gripper_pos) - kd * (
-            #     curr_gripper_vel
-            # )
-
+            # TODO WSH: Implement gripper position matching
             gripper_torque = 0.0
             self.set_leader_joint_torque(torque, gripper_torque)
             time.sleep(0.1)
@@ -661,28 +707,27 @@ class Factr(Node, ABC):
         )
 
         torque_arm = np.zeros(self.num_arm_joints)
+
+        # Joint limit barrier
         torque_l, torque_gripper = self.joint_limit_barrier(
             leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel
         )
-        # print(f"JL Barrier {torque_gripper}")
         torque_arm += torque_l
 
+        # Null space regulation
         torque_null_space = self.null_space_regulation(leader_arm_pos, leader_arm_vel)
-        # print(f"NS Reg {torque_null_space}")
         torque_arm += torque_null_space
 
+        # Gravity and friction compensation
         if self.enable_gravity_comp:
             torque_gravity_comp = self.gravity_compensation(
                 leader_arm_pos, leader_arm_vel
             )
             torque_friction_comp = self.friction_compensation(leader_arm_vel)
-
-            # print(f"Grav Comp {torque_gravity_comp}")
-            # print(f"Friction Comp {torque_friction_comp}")
-
             torque_arm += torque_gravity_comp
             torque_arm += torque_friction_comp
 
+        # Torque feedback
         if self.enable_torque_feedback:
             external_joint_torque = self.get_leader_arm_external_joint_torque()
             torque_feedback = self.torque_feedback(
@@ -691,18 +736,19 @@ class Factr(Node, ABC):
 
             # Only consider the second joint
             torque_feedback[4:] = 0.0
-
-            print(f"Torque FB {torque_feedback}")
+            self.get_logger().debug(f"Torque feedback: {torque_feedback}")
 
             self.latest_leader_torques = torque_feedback
             torque_arm += torque_feedback
 
+        # Gripper feedback
         if self.enable_gripper_feedback:
             gripper_feedback = self.get_leader_gripper_feedback()
             torque_gripper += self.gripper_feedback(
                 leader_gripper_pos, leader_gripper_vel, gripper_feedback
             )
 
+        # Apply torque limits
         if np.any(np.abs(torque_arm) > self.global_torque_limit):
             self.get_logger().warning("Global torque limit exceeded!")
 
@@ -720,11 +766,6 @@ class Factr(Node, ABC):
                 self.smoothing_alpha * torque_gripper
                 + (1 - self.smoothing_alpha) * self.smoothed_torque_gripper
             )
-
-            # self.latest_leader_torques = np.concatenate(
-            #     [self.smoothed_torque_arm.copy(), [self.smoothed_torque_gripper]]
-            # )
-
             self.set_leader_joint_torque(
                 self.smoothed_torque_arm, self.smoothed_torque_gripper
             )
@@ -734,6 +775,10 @@ class Factr(Node, ABC):
             )
             self.set_leader_joint_torque(torque_arm, torque_gripper)
 
+        # Publish joint states for RViz visualization
+        self._publish_joint_states(leader_arm_pos, leader_gripper_pos)
+
+        # Update communication with follower
         self.update_communication(leader_arm_pos, leader_gripper_pos)
 
     @abstractmethod

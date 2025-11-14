@@ -3,7 +3,7 @@ import numpy as np
 
 import rclpy
 from factr_interface.factr_teleop import Factr
-from gui import Gui
+# from gui import Gui
 
 from sensor_msgs.msg import JointState
 
@@ -17,7 +17,7 @@ class FACTRTeleopMujoco(Factr):
 
     def __init__(self):
         super().__init__()
-        self.gui = Gui()
+        # self.gui = Gui()
         # Store the latest torques for visualization
         self.latest_follower_torques = np.zeros(self.num_arm_joints)
 
@@ -82,7 +82,7 @@ class FACTRTeleopMujoco(Factr):
 
         # Update the GUI with torque data
         # print(f"Latest toruqes: {self.latest_leader_torques}")
-        self.gui.update(leader_arm_pos, leader_gripper_pos, self.latest_leader_torques)
+        # self.gui.update(leader_arm_pos, leader_gripper_pos, self.latest_leader_torques)
 
         command_msg = JointState()
         command_msg.name = [f"fr3_joint{n}" for n in range(1, 8)]
