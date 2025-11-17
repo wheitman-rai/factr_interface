@@ -48,6 +48,7 @@ class Factr(Node, ABC):
         self._prepare_inverse_dynamics()
 
         # Initialize state variables
+        self.arms_are_aligned = False
         self.latest_follower_positions = None
         self.latest_leader_torques = np.zeros(7)
 
@@ -59,7 +60,6 @@ class Factr(Node, ABC):
 
         # Calibration and initialization sequence
         self._set_homing_offsets_in_docked_position()
-        self._match_start_pos()
 
         # Start the control loop
         self.timer = self.create_timer(self.dt, self.control_loop_callback)
@@ -169,9 +169,9 @@ class Factr(Node, ABC):
         self.gripper_spring_constant = controller_config["gripper_feedback"][
             "spring_constant"
         ]
-        self.gripper_spring_displacement_offset = controller_config[
-            "gripper_feedback"
-        ]["spring_displacement_offset"]
+        self.gripper_spring_displacement_offset = controller_config["gripper_feedback"][
+            "spring_displacement_offset"
+        ]
 
         # Exponential smoothing
         self.enable_exponential_smoothing = controller_config["exponential_smoothing"][
@@ -184,11 +184,13 @@ class Factr(Node, ABC):
     def _setup_joint_state_publisher(self):
         """Set up publisher for joint states to visualize in RViz."""
         self.joint_state_pub = self.create_publisher(
-            JointState, "leader_joint_states", 10
+            JointState, "/factr/joint_states", 10
         )
-        self.get_logger().info("Joint state publisher initialized for RViz visualization")
+        self.get_logger().info(
+            "Joint state publisher initialized for RViz visualization"
+        )
 
-    def _publish_joint_states(self, arm_positions, gripper_position=None):
+    def _publish_joint_states(self):
         """
         Publish current joint states for RViz visualization.
 
@@ -199,6 +201,10 @@ class Factr(Node, ABC):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = ""
+
+        arm_positions, curr_vel, gripper_position, curr_gripper_vel = (
+            self.get_leader_joint_states()
+        )
 
         # Joint names matching the URDF (joint_1, joint_2, etc.)
         msg.name = [f"joint_{i+1}" for i in range(self.num_arm_joints)]
@@ -418,77 +424,43 @@ class Factr(Node, ABC):
         )
         self.pin_data = self.pin_model.createData()
 
-    def _match_start_pos(self):
+    def _match_start_pos(self) -> bool:
         """
-        Waits until the leader arm is manually moved to roughly the same configuration as the
-        follower arm before the follower arm starts mirroring the leader arm.
+        Determines if the leader arm (FACTR) is sufficiently aligned with the follower (Franka)
         """
         # First, wait for the follower position to be available
-        self.get_logger().info("Waiting for follower joint positions...")
-        while self.latest_follower_positions is None and rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.1)
+        if self.latest_follower_positions is None:
+            self.get_logger().info("Waiting for follower joint positions...")
+            return
 
-        if not rclpy.ok():
-            return  # Node is shutting down
+        curr_pos, curr_vel, curr_gripper_pos, curr_gripper_vel = (
+            self.get_leader_joint_states()
+        )
+
+        assert (
+            self.latest_follower_positions.shape[0] == self.num_arm_joints
+        ), f"Received {self.latest_follower_positions.shape[0]} follower positions but expected {self.num_arm_joints}"
+
+        current_joint_error = np.linalg.norm(curr_pos - self.latest_follower_positions)
+
+        np.set_printoptions(suppress=True, precision=4)
+        self.get_logger().info(
+            f"FACTR TELEOP {self.name}: Please match starting joint pos. Current joint pos: {curr_pos}"
+        )
 
         self.get_logger().info(
-            "Follower positions received. Starting position matching..."
+            f"Errors {current_joint_error:.2f}: {curr_pos - self.latest_follower_positions}"
         )
 
-        interpolation_step_size = (
-            np.ones(7)
-            * self.config["controller"]["joint_position_control"][
-                "interpolation_step_size"
-            ]
-        )
-        kp = self.config["controller"]["joint_position_control"]["kp"]
-        kd = self.config["controller"]["joint_position_control"]["kd"]
+        # Check if position is matched
+        if np.all(np.abs(curr_pos - self.latest_follower_positions) < 0.2):
+            return True  # Each joint is close enough to expected start position!
 
-        while rclpy.ok():
-            curr_pos, curr_vel, curr_gripper_pos, curr_gripper_vel = (
-                self.get_leader_joint_states()
-            )
-            next_joint_pos_target = np.where(
-                np.abs(curr_pos - self.latest_follower_positions)
-                > interpolation_step_size,
-                curr_pos
-                + interpolation_step_size
-                * np.sign(self.latest_follower_positions - curr_pos),
-                self.latest_follower_positions,
-            )
-            current_joint_error = np.linalg.norm(
-                curr_pos - self.latest_follower_positions
-            )
-            np.set_printoptions(suppress=True, precision=4)
-            self.get_logger().info(
-                f"FACTR TELEOP {self.name}: Please match starting joint pos. Current joint pos: {curr_pos}"
-            )
+        else:
+            return False
 
-            self.get_logger().info(
-                f"Errors {current_joint_error:.2f}: {curr_pos - self.latest_follower_positions}"
-            )
-
-            # Check if position is matched
-            if np.all(np.abs(curr_pos - self.latest_follower_positions) < 0.2):
-                break  # Each joint is close enough to expected start position!
-
-            curr_pos, _, _, _ = self.get_leader_joint_states()
-
-            goal_gripper_pos = 0.0  # TODO WSH: Read from follower
-
-            torque = -kp * (curr_pos - next_joint_pos_target) - kd * (curr_vel)
-
-            # Only consider the first two joints
-            torque[4:] = 0.0
-
-            # TODO WSH: Implement gripper position matching
-            gripper_torque = 0.0
-            self.set_leader_joint_torque(torque, gripper_torque)
-            time.sleep(0.1)
-
-        self.get_logger().info(
-            f"FACTR TELEOP {self.name}: Initial joint position matched."
-        )
+        curr_pos, _, _, _ = self.get_leader_joint_states()
+        time.sleep(0.1)
 
     def shut_down(self):
         """
@@ -702,6 +674,14 @@ class Factr(Node, ABC):
         and the Return Delay Time is set to 0 using the Dynamixel Wizard software.
         """
 
+        # Publish joint states for RViz visualization
+        self._publish_joint_states()
+
+        # This ensures that the leader and follower positions more or less match.
+        # If they don't, then force feedback is not applied, and torques are not sent to the follower
+        if not self.arms_are_aligned:
+            self.arms_are_aligned: bool = self._match_start_pos()
+
         leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = (
             self.get_leader_joint_states()
         )
@@ -728,7 +708,7 @@ class Factr(Node, ABC):
             torque_arm += torque_friction_comp
 
         # Torque feedback
-        if self.enable_torque_feedback:
+        if self.enable_torque_feedback and self.arms_are_aligned:
             external_joint_torque = self.get_leader_arm_external_joint_torque()
             torque_feedback = self.torque_feedback(
                 external_joint_torque, leader_arm_vel
@@ -775,11 +755,9 @@ class Factr(Node, ABC):
             )
             self.set_leader_joint_torque(torque_arm, torque_gripper)
 
-        # Publish joint states for RViz visualization
-        self._publish_joint_states(leader_arm_pos, leader_gripper_pos)
-
         # Update communication with follower
-        self.update_communication(leader_arm_pos, leader_gripper_pos)
+        if self.arms_are_aligned:
+            self.send_follower_commands(leader_arm_pos, leader_gripper_pos)
 
     @abstractmethod
     def set_up_communication(self):
@@ -859,7 +837,7 @@ class Factr(Node, ABC):
         pass
 
     @abstractmethod
-    def update_communication(self, leader_arm_pos, leader_gripper_pos):
+    def send_follower_commands(self, leader_arm_pos, leader_gripper_pos):
         """
         This method is intended to be called at every iteration of the control loop to transmit
         relevant data, such as joint position targets, from the leader to the follower arm.

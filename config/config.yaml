@@ -52,12 +52,12 @@ controller:
     alpha: 0.1
   torque_feedback:
     enable: False
-    gain: 2.4
+    gain: 2.0
     damping: 0.3
     motor_scalar: 94.5652173913
   gravity_comp:
     enable: True
-    gain: 0.6
+    gain: 0.8
   null_space_regulation:
     null_space_joint_target: [0.0, -0.7854, 0.0, -2.356, 0.0, 1.57, 0.0, 0.0]
     kp: 0.0
@@ -81,7 +81,7 @@ controller:
     # kd: 0.04315069084
 
   gripper_feedback:
-    enable: False
+    enable: True
     gain: 0.28328611898
     ema_beta: 0.95
     spring_constant: 0.06

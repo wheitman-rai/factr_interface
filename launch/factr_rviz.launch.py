@@ -23,10 +23,7 @@ def generate_launch_description():
     rviz_config_file = os.path.join(pkg_dir, "rviz", "factr_teleop.rviz")
 
     # Robot description parameter
-    robot_description = ParameterValue(
-        Command(['cat ', urdf_file]),
-        value_type=str
-    )
+    robot_description = ParameterValue(Command(["cat ", urdf_file]), value_type=str)
 
     # Declare launch arguments
     use_sim_time = LaunchConfiguration("use_sim_time", default="false")
@@ -43,31 +40,30 @@ def generate_launch_description():
             Node(
                 package="robot_state_publisher",
                 executable="robot_state_publisher",
-                name="robot_state_publisher",
-                output="screen",
-                parameters=[
-                    {
-                        "robot_description": robot_description,
-                        "use_sim_time": use_sim_time,
-                        "publish_frequency": 30.0,
-                    }
+                name="factr_state_publisher",
+                parameters=[{"robot_description": robot_description}],
+                remappings=[
+                    ("/joint_states", "/factr/joint_states"),
+                    ("/robot_description", "/factr/robot_description"),
                 ],
             ),
             # FACTR Teleoperation Node
-            Node(
-                package="factr_interface",
-                executable="factr_teleop_node",
-                name="factr_teleop_node",
-                output="screen",
-                parameters=[{"use_sim_time": use_sim_time}],
-            ),
+            # Node(
+            #     package="factr_interface",
+            #     executable="factr_teleop_node",
+            #     name="factr_teleop_node",
+            #     output="screen",
+            #     parameters=[{"use_sim_time": use_sim_time}],
+            # ),
             # RViz2
             Node(
                 package="rviz2",
                 executable="rviz2",
                 name="rviz2",
                 output="screen",
-                arguments=["-d", rviz_config_file] if os.path.exists(rviz_config_file) else [],
+                arguments=(
+                    ["-d", rviz_config_file] if os.path.exists(rviz_config_file) else []
+                ),
                 parameters=[{"use_sim_time": use_sim_time}],
             ),
         ]
